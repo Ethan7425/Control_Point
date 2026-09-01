@@ -1,0 +1,177 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
+<title>Control Point</title>
+<meta name="theme-color" content="#0f172a">
+<meta name="description" content="Orienteering-style GPS running game.">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin="">
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark">◎</span>
+    <span class="brand-name">Control Point</span>
+  </div>
+  <nav class="topnav">
+    <button data-view="settings" class="navbtn active">Run</button>
+    <button data-view="history" class="navbtn">History</button>
+  </nav>
+</header>
+
+<div id="install-banner" class="install-banner hidden">
+  <span id="install-banner-text">Install Control Point for the full-screen app experience.</span>
+  <div class="install-banner-actions">
+    <button id="install-banner-action" class="install-btn hidden">Install</button>
+    <button id="install-banner-dismiss" class="install-dismiss" aria-label="Dismiss">&times;</button>
+  </div>
+</div>
+
+<main id="app">
+
+  <!-- SETTINGS VIEW -->
+  <section id="view-settings" class="view active">
+    <form id="settings-form">
+      <div class="field-group">
+        <label>Game mode</label>
+        <div class="segmented" data-field="mode">
+          <button type="button" class="seg active" data-value="explore">Free Explore</button>
+          <button type="button" class="seg" data-value="timeTrial">Time Trial</button>
+          <button type="button" class="seg" data-value="scoreAttack">Score Attack</button>
+        </div>
+        <p class="hint" id="mode-hint">Wander to generated points at your own pace. No scoring.</p>
+      </div>
+
+      <div class="field-group">
+        <label>Point layout</label>
+        <div class="segmented" data-field="layout">
+          <button type="button" class="seg active" data-value="scatter">Scatter (radius)</button>
+          <button type="button" class="seg" data-value="loop">Loop (~distance)</button>
+        </div>
+      </div>
+
+      <div class="field-group" id="row-radius">
+        <label for="radius">Radius <span class="unit" id="radius-val">1.2 km</span></label>
+        <input type="range" id="radius" min="0.3" max="5" step="0.1" value="1.2">
+      </div>
+
+      <div class="field-group hidden" id="row-distance">
+        <label for="distance">Target loop distance <span class="unit" id="distance-val">3.0 km</span></label>
+        <input type="range" id="distance" min="1" max="15" step="0.5" value="3">
+      </div>
+
+      <div class="field-group">
+        <label for="numPoints">Number of points <span class="unit" id="numPoints-val">6</span></label>
+        <input type="range" id="numPoints" min="2" max="20" step="1" value="6">
+      </div>
+
+      <div class="two-col">
+        <div class="field-group">
+          <label for="minSpacing">Min spacing <span class="unit" id="minSpacing-val">80 m</span></label>
+          <input type="range" id="minSpacing" min="20" max="500" step="10" value="80">
+        </div>
+        <div class="field-group">
+          <label for="maxSpacing">Max spacing <span class="unit" id="maxSpacing-val">600 m</span></label>
+          <input type="range" id="maxSpacing" min="100" max="2000" step="50" value="600">
+        </div>
+      </div>
+
+      <div class="field-group">
+        <label>Point style</label>
+        <div class="segmented" data-field="style">
+          <button type="button" class="seg" data-value="random">Pure random</button>
+          <button type="button" class="seg active" data-value="path">Snapped to path</button>
+          <button type="button" class="seg" data-value="poi">POI-flavored</button>
+        </div>
+        <p class="hint">Path/POI styles query OpenStreetMap so points land somewhere you can actually walk.</p>
+      </div>
+
+      <div class="field-group hidden" id="row-timeBudget">
+        <label for="timeBudget">Time budget <span class="unit" id="timeBudget-val">20 min</span></label>
+        <input type="range" id="timeBudget" min="5" max="60" step="5" value="20">
+      </div>
+
+      <button type="submit" id="start-btn" class="primary-btn">Generate points &amp; start</button>
+      <p class="hint" id="loc-status">Location permission will be requested when you start.</p>
+    </form>
+  </section>
+
+  <!-- LOADING VIEW -->
+  <section id="view-loading" class="view">
+    <div class="loading-screen">
+      <div class="spinner" aria-hidden="true"></div>
+      <p class="loading-status" id="loading-status">Getting your location…</p>
+      <p class="hint" id="loading-substatus"></p>
+      <button id="loading-cancel" class="secondary-btn">Cancel</button>
+    </div>
+  </section>
+
+  <!-- RUN VIEW -->
+  <section id="view-run" class="view">
+    <div id="map"></div>
+    <div class="stat-bar" id="stat-bar">
+      <div class="stat"><span class="stat-label">Time</span><span class="stat-value" id="stat-time">00:00</span></div>
+      <div class="stat"><span class="stat-label">Distance</span><span class="stat-value" id="stat-distance">0.00 km</span></div>
+      <div class="stat" id="stat-points-wrap"><span class="stat-label">Points</span><span class="stat-value" id="stat-points">0 / 0</span></div>
+      <div class="stat hidden" id="stat-score-wrap"><span class="stat-label">Score</span><span class="stat-value" id="stat-score">0</span></div>
+      <div class="stat hidden" id="stat-countdown-wrap"><span class="stat-label">Left</span><span class="stat-value" id="stat-countdown">00:00</span></div>
+    </div>
+    <div id="next-point-indicator" class="next-point hidden"></div>
+    <button id="end-run-btn" class="end-btn">End Run</button>
+    <div id="collect-toast" class="toast hidden"></div>
+  </section>
+
+  <!-- RECAP VIEW -->
+  <section id="view-recap" class="view">
+    <div id="recap-content"></div>
+  </section>
+
+  <!-- HISTORY VIEW -->
+  <section id="view-history" class="view">
+    <h2 class="section-title">Run history</h2>
+    <div id="history-summary"></div>
+    <div id="history-list" class="history-list"></div>
+    <div id="history-detail" class="hidden"></div>
+  </section>
+
+</main>
+
+<div id="permission-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Location access needed</h3>
+    <p id="permission-msg">Control Point needs your location to generate points around you and track your run.</p>
+    <button id="permission-retry" class="primary-btn">Try again</button>
+    <button id="permission-cancel" class="secondary-btn">Cancel</button>
+  </div>
+</div>
+
+<div id="end-run-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>End this run?</h3>
+    <p>You'll see your recap next. This can't be undone.</p>
+    <button id="end-run-confirm" class="primary-btn end-run-confirm-btn">End Run</button>
+    <button id="end-run-keep-going" class="secondary-btn">Keep Running</button>
+  </div>
+</div>
+
+<div id="delete-run-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Delete this run?</h3>
+    <p>This removes it from your history for good. This can't be undone.</p>
+    <button id="delete-run-confirm" class="primary-btn end-run-confirm-btn">Delete</button>
+    <button id="delete-run-cancel" class="secondary-btn">Cancel</button>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script type="module" src="js/app.js"></script>
+</body>
+</html>
