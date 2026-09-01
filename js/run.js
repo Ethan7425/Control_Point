@@ -7,9 +7,10 @@ import { haversine } from './geo.js';
 export const COLLECT_RADIUS_M = 20; // GPS in cities is often ±10m; 15-25m avoids false negatives
 
 export class RunController {
-  constructor(settings, points, startPosition) {
+  constructor(settings, points, startPosition, loopGeometry = null) {
     this.settings = settings;
-    this.points = points; // array from points.js, mutated in place as collected
+    this.points = points; // array from points.js, mutated in place as collected/rerolled
+    this.loopGeometry = loopGeometry; // suggested route line for Loop layout, or null
     this.route = []; // [{lat, lon, t}]
     this.distanceM = 0;
     this.startedAt = Date.now();
@@ -18,6 +19,15 @@ export class RunController {
     this._lastCollected = null;
 
     if (startPosition) this._pushRoutePoint(startPosition.lat, startPosition.lon);
+  }
+
+  // Swaps out an uncollected point for a replacement (same index/slot), returning
+  // true if it found something to replace. No-op on an already-collected point.
+  replacePoint(oldId, newPoint) {
+    const idx = this.points.findIndex((p) => p.id === oldId);
+    if (idx === -1 || this.points[idx].collected) return false;
+    this.points[idx] = newPoint;
+    return true;
   }
 
   _pushRoutePoint(lat, lon) {
@@ -97,6 +107,7 @@ export class RunController {
       route: this.route,
       points: this.points,
       settings: this.settings,
+      loopGeometry: this.loopGeometry,
     };
   }
 }

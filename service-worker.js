@@ -1,7 +1,7 @@
 // App-shell cache so the PWA installs and opens offline. Live data (Overpass,
 // OSRM, GPS) is always network-only — only the shell and map tiles are cached.
 
-const SHELL_CACHE = 'control-point-shell-v12';
+const SHELL_CACHE = 'control-point-shell-v15';
 const TILE_CACHE = 'control-point-tiles-v1';
 
 const SHELL_ASSETS = [

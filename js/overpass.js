@@ -78,12 +78,14 @@ export async function fetchPOINodes(lat, lon, radiusM) {
     }));
 }
 
-// Best-effort loop ordering via the public OSRM trip service (round trip, foot profile).
-// Falls back silently to the caller's own ordering if the request fails.
+// Best-effort loop ordering + route geometry via the public OSRM trip service
+// (round trip, foot profile). Falls back silently to the caller's own ordering
+// with no geometry if the request fails — the suggested path is a nice-to-have,
+// never a requirement to start a run.
 export async function orderAsLoop(points) {
-  if (points.length < 3) return points.map((_, i) => i);
+  if (points.length < 3) return { order: points.map((_, i) => i), geometry: null };
   const coords = points.map((p) => `${p.lon},${p.lat}`).join(';');
-  const url = `https://router.project-osrm.org/trip/v1/foot/${coords}?roundtrip=true&source=first`;
+  const url = `https://router.project-osrm.org/trip/v1/foot/${coords}?roundtrip=true&source=first&geometries=geojson&overview=full`;
   try {
     const res = await fetch(url);
     if (!res.ok) throw new Error('OSRM trip failed');
@@ -93,9 +95,10 @@ export async function orderAsLoop(points) {
       .map((w, originalIndex) => ({ originalIndex, tripIndex: w.waypoint_index }))
       .sort((a, b) => a.tripIndex - b.tripIndex)
       .map((w) => w.originalIndex);
-    return order;
+    const geometry = data.trips?.[0]?.geometry?.coordinates?.map(([lon, lat]) => [lat, lon]) || null;
+    return { order, geometry };
   } catch (e) {
     console.warn('OSRM loop ordering unavailable, using original order:', e.message);
-    return points.map((_, i) => i);
+    return { order: points.map((_, i) => i), geometry: null };
   }
 }

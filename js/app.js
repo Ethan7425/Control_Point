@@ -1,17 +1,33 @@
 import { getCurrentPosition, GeoWatcher, bearing, compassDirection, haversine } from './geo.js';
-import { generatePoints } from './points.js';
+import { generatePoints, rerollPoint } from './points.js';
 import { RunController, COLLECT_RADIUS_M } from './run.js';
 import { saveRun, getAllRuns, getRun, deleteRun } from './db.js';
 import { renderRunRecap, renderHistoryList, renderHistorySummary, fmtTime } from './render.js';
 import { unlockAudio, feedbackCollect, feedbackTimeUp } from './feedback.js';
 import { downloadGPX } from './gpx.js';
 
+// ---------- version ----------
+// Bump this on every push — it's the quickest way to confirm a device is actually
+// running the latest deploy (shown small next to the app name in the header).
+const APP_VERSION = '1.0.0';
+document.getElementById('app-version').textContent = `v${APP_VERSION}`;
+console.log(`Control Point v${APP_VERSION}`);
+
 // ---------- service worker ----------
 // Beyond serving network-first, actively self-heal from a stale install: force an
-// update check on every load, and if a newer worker takes over an *already-controlled*
-// tab (i.e. this isn't the very first install), reload once so the tab actually runs
+// update check on every load, and if a newer worker takes over a tab that was
+// *already being controlled by an older one*, reload once so the tab actually runs
 // the new code instead of silently sitting on the old one until the user notices.
+//
+// `hadControllerAtLoad` must be captured before register() runs. Our SW calls
+// clients.claim() on activate, which — by design — takes control of the current
+// page immediately, even on the very first-ever install. Checking
+// navigator.serviceWorker.controller *after* the fact is true on every visit, first
+// one included, which would auto-reload the page right as someone's mid-action
+// (e.g. right after tapping Start) — this flag is what tells a real update apart
+// from a fresh install.
 if ('serviceWorker' in navigator) {
+  const hadControllerAtLoad = !!navigator.serviceWorker.controller;
   window.addEventListener('load', async () => {
     try {
       const reg = await navigator.serviceWorker.register('service-worker.js');
@@ -19,7 +35,7 @@ if ('serviceWorker' in navigator) {
       reg.addEventListener('updatefound', () => {
         const newWorker = reg.installing;
         newWorker?.addEventListener('statechange', () => {
-          if (newWorker.state === 'activated' && navigator.serviceWorker.controller) {
+          if (newWorker.state === 'activated' && hadControllerAtLoad) {
             window.location.reload();
           }
         });
@@ -162,6 +178,37 @@ sliderIds.forEach((id) => {
   update();
 });
 
+// ---------- settings persistence (remembers your last-used setup across visits) ----------
+const SETTINGS_STORAGE_KEY = 'cp_last_settings';
+const SLIDER_KEY_TO_ID = {
+  radiusKm: 'radius', distanceKm: 'distance', numPoints: 'numPoints',
+  minSpacing: 'minSpacing', maxSpacing: 'maxSpacing', timeBudgetMin: 'timeBudget',
+};
+
+function applySavedSettings(saved) {
+  Object.entries(SLIDER_KEY_TO_ID).forEach(([key, id]) => {
+    if (saved[key] != null) document.getElementById(id).value = saved[key];
+  });
+  sliderIds.forEach((id) => document.getElementById(id).dispatchEvent(new Event('input')));
+
+  ['mode', 'layout', 'style'].forEach((key) => {
+    if (!saved[key]) return;
+    fields[key] = saved[key];
+    document.querySelectorAll(`.segmented[data-field="${key}"] .seg`).forEach((btn) => {
+      btn.classList.toggle('active', btn.dataset.value === saved[key]);
+    });
+  });
+  onFieldChange('layout');
+  onFieldChange('mode');
+}
+
+try {
+  const saved = JSON.parse(localStorage.getItem(SETTINGS_STORAGE_KEY) || 'null');
+  if (saved) applySavedSettings(saved);
+} catch {
+  // corrupt/unavailable storage — just start from the defaults already in the DOM
+}
+
 function readSettings() {
   return {
     mode: fields.mode,
@@ -232,6 +279,11 @@ async function beginRun() {
 
   const center = { lat: pos.coords.latitude, lon: pos.coords.longitude };
   const settings = readSettings();
+  try {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify(settings));
+  } catch {
+    // storage unavailable (private browsing, quota) — not worth failing the run over
+  }
 
   const isLive = settings.style !== 'random';
   setLoadingStatus(
@@ -243,10 +295,10 @@ async function beginRun() {
   // is unreachable, so this should rarely throw — but retry a couple of times on a
   // genuine failure before giving up, since a transient blip shouldn't dead-end the run.
   const MAX_ATTEMPTS = 3;
-  let points, usedFallback, lastErr;
+  let points, usedFallback, loopGeometry, rerollContext, lastErr;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      ({ points, usedFallback } = await generatePoints(center, settings));
+      ({ points, usedFallback, loopGeometry, rerollContext } = await generatePoints(center, settings));
       lastErr = null;
       break;
     } catch (err) {
@@ -278,12 +330,17 @@ async function beginRun() {
   if (launchCancelled) return;
 
   locStatus.textContent = 'Location permission will be requested when you start.';
-  startRunSession(center, settings, points, usedFallback && settings.style !== 'random');
+  startRunSession(center, settings, points, usedFallback && settings.style !== 'random', loopGeometry, rerollContext);
 }
 
 // ---------- run session ----------
-let map, userMarker, userAccuracyCircle, routeLine, pointMarkers = [], pointCircles = [];
+let map, userMarker, userAccuracyCircle, routeLine, loopRouteLine, pointMarkers = [], pointCircles = [];
 let runController, geoWatcher, statsTimer, lastKnownLatLng = null, timeUpAnnounced = false;
+let currentCenter = null, currentRerollContext = null;
+
+function escapeHtml(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
 
 function pointIcon(p) {
   return L.divIcon({
@@ -327,12 +384,50 @@ const RecenterControl = L.Control.extend({
   },
 });
 
-function startRunSession(center, settings, points, usedFallback) {
+// Tapping a point shows its name and, if it's still uncollected, a "Reroll this
+// point" button — for when the generator drops one somewhere genuinely awkward.
+function bindPointPopup(marker, point) {
+  const html = point.collected
+    ? `<div class="cp-popup"><strong>${escapeHtml(point.name)}</strong><br><span class="cp-popup-status">Collected ✓</span></div>`
+    : `<div class="cp-popup"><strong>${escapeHtml(point.name)}</strong><br><button type="button" class="cp-popup-reroll" data-id="${point.id}">Reroll this point</button></div>`;
+  marker.unbindPopup();
+  marker.bindPopup(html);
+  marker.off('popupopen');
+  marker.on('popupopen', () => {
+    marker.getPopup()?.getElement()?.querySelector('.cp-popup-reroll')?.addEventListener('click', () => handleReroll(point.id));
+  });
+}
+
+function handleReroll(pointId) {
+  const idx = runController?.points.findIndex((p) => p.id === pointId);
+  if (idx == null || idx === -1 || !currentRerollContext) return;
+  const target = runController.points[idx];
+  if (target.collected) return;
+
+  const newPoint = rerollPoint(target, runController.points, currentCenter, runController.settings, currentRerollContext);
+  runController.replacePoint(target.id, newPoint);
+
+  map.closePopup();
+  map.removeLayer(pointMarkers[idx]);
+  map.removeLayer(pointCircles[idx]);
+  pointMarkers[idx] = L.marker([newPoint.lat, newPoint.lon], { icon: pointIcon(newPoint) }).addTo(map);
+  bindPointPopup(pointMarkers[idx], newPoint);
+  pointCircles[idx] = L.circle([newPoint.lat, newPoint.lon], {
+    radius: COLLECT_RADIUS_M, className: 'cp-radius-glow', ...circleStyle(false),
+  }).addTo(map);
+
+  showToast(`Point ${newPoint.index} re-rolled`);
+  updateNextPointIndicator();
+}
+
+function startRunSession(center, settings, points, usedFallback, loopGeometry, rerollContext) {
   showView('run');
   document.getElementById('stat-score-wrap').classList.toggle('hidden', settings.mode !== 'scoreAttack');
   document.getElementById('stat-countdown-wrap').classList.toggle('hidden', settings.mode !== 'scoreAttack');
 
-  runController = new RunController(settings, points, center);
+  runController = new RunController(settings, points, center, loopGeometry);
+  currentCenter = center;
+  currentRerollContext = rerollContext;
   lastKnownLatLng = [center.lat, center.lon];
   timeUpAnnounced = false;
   acquireWakeLock();
@@ -355,7 +450,19 @@ function startRunSession(center, settings, points, usedFallback) {
   L.control.zoom({ position: 'bottomright' }).addTo(map);
   map.addControl(new RecenterControl());
 
-  pointMarkers = points.map((p) => L.marker([p.lat, p.lon], { icon: pointIcon(p) }).addTo(map).bindTooltip(p.name));
+  loopRouteLine = null;
+  if (loopGeometry?.length) {
+    // A suggestion, not a mandate — dashed and muted so it doesn't compete with the live route.
+    loopRouteLine = L.polyline(loopGeometry, {
+      color: '#f59e0b', weight: 3, opacity: 0.5, dashArray: '6,10', interactive: false,
+    }).addTo(map);
+  }
+
+  pointMarkers = points.map((p) => {
+    const marker = L.marker([p.lat, p.lon], { icon: pointIcon(p) }).addTo(map);
+    bindPointPopup(marker, p);
+    return marker;
+  });
   pointCircles = points.map((p) =>
     L.circle([p.lat, p.lon], { radius: COLLECT_RADIUS_M, className: 'cp-radius-glow', ...circleStyle(false) }).addTo(map)
   );
@@ -397,6 +504,7 @@ function onPositionUpdate(pos) {
   if (collected) {
     const idx = runController.points.findIndex((p) => p.id === collected.id);
     pointMarkers[idx]?.setIcon(pointIcon(collected));
+    if (pointMarkers[idx]) bindPointPopup(pointMarkers[idx], collected); // drop the reroll option once collected
     pointCircles[idx]?.setStyle(circleStyle(true));
     pointCircles[idx]?.getElement()?.classList.remove('cp-radius-glow');
     showToast(`Collected: ${collected.name} (+${collected.weight})`);
@@ -459,6 +567,25 @@ function updateNextPointIndicator() {
   el.classList.remove('hidden');
 }
 
+const MODE_LABEL_FOR_SHARE = { explore: 'Free Explore', timeTrial: 'Time Trial', scoreAttack: 'Score Attack' };
+
+async function shareRun(run) {
+  const text =
+    `Control Point — ${MODE_LABEL_FOR_SHARE[run.mode] || run.mode}\n` +
+    `${(run.distanceM / 1000).toFixed(2)} km in ${fmtTime(run.totalMs)} · ${run.pointsCollected}/${run.pointsTotal} points` +
+    (run.mode === 'scoreAttack' ? ` · score ${run.score}` : '');
+  try {
+    if (navigator.share) {
+      await navigator.share({ title: 'Control Point run', text });
+    } else if (navigator.clipboard) {
+      await navigator.clipboard.writeText(text);
+      showToast('Recap copied to clipboard');
+    }
+  } catch (e) {
+    if (e.name !== 'AbortError') console.warn('Share failed:', e.message); // AbortError = user just cancelled the share sheet
+  }
+}
+
 // A native confirm() is used nowhere here on purpose: window.confirm()/alert()/prompt()
 // silently no-op in an iOS home-screen-installed (standalone) PWA — the call just
 // returns without ever showing anything, which reads as "the button does nothing".
@@ -492,6 +619,7 @@ async function endRun() {
   showView('recap');
   const container = document.getElementById('recap-content');
   renderRunRecap(container, run, 'recap-map');
+  document.getElementById('share-run-btn')?.addEventListener('click', () => shareRun(run));
   document.getElementById('export-gpx-btn')?.addEventListener('click', () => downloadGPX(run));
 
   const actions = document.createElement('div');
@@ -542,6 +670,7 @@ async function loadHistory() {
       detail.classList.remove('hidden');
       detail.innerHTML = `<button class="back-btn" id="history-back">&larr; Back to history</button><div id="history-detail-body"></div>`;
       renderRunRecap(document.getElementById('history-detail-body'), run, 'history-map');
+      document.getElementById('share-run-btn')?.addEventListener('click', () => shareRun(run));
       document.getElementById('export-gpx-btn')?.addEventListener('click', () => downloadGPX(run));
       document.getElementById('history-back').addEventListener('click', () => {
         detail.classList.add('hidden');

@@ -57,6 +57,7 @@ export function renderRunRecap(container, run, mapDivId) {
         </li>
       `).join('')}
     </ul>
+    <button id="share-run-btn" class="secondary-btn">Share Recap</button>
     <button id="export-gpx-btn" class="secondary-btn">Export GPX</button>
   `;
 
@@ -66,8 +67,20 @@ export function renderRunRecap(container, run, mapDivId) {
     const map = L.map(mapDivId, { zoomControl: false, attributionControl: false, tap: true });
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
 
+    const bounds = L.latLngBounds([]);
+
+    // The suggested loop path (if any) drawn first/underneath, so the actual GPS
+    // route stays visually on top — this is a suggestion, not a mandate to follow.
+    if (run.loopGeometry?.length) {
+      const suggested = L.polyline(run.loopGeometry, {
+        color: '#f59e0b', weight: 3, opacity: 0.5, dashArray: '6,10', interactive: false,
+      }).addTo(map);
+      bounds.extend(suggested.getBounds());
+    }
+
     const latlngs = run.route.map((r) => [r.lat, r.lon]);
     const routeLine = L.polyline(latlngs, { color: '#3b82f6', weight: 4, opacity: 0.85 }).addTo(map);
+    bounds.extend(routeLine.getBounds());
 
     run.points.forEach((p) => {
       // Faint collection-radius ring so a near-miss is visible, not just a red dot.
@@ -89,7 +102,6 @@ export function renderRunRecap(container, run, mapDivId) {
       }).addTo(map).bindTooltip(`${p.index}. ${p.name}`);
     });
 
-    const bounds = routeLine.getBounds();
     run.points.forEach((p) => bounds.extend([p.lat, p.lon]));
     map.fitBounds(bounds, { padding: [24, 24] });
   });

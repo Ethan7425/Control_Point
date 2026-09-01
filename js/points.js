@@ -87,6 +87,21 @@ function makePoolSource(pool) {
   return source;
 }
 
+function toPoint(candidate, index, center) {
+  const distFromStart = haversine(center.lat, center.lon, candidate.lat, candidate.lon);
+  return {
+    id: `p${index}_${Date.now()}_${Math.round(candidate.lat * 1e6)}_${Math.round(candidate.lon * 1e6)}`,
+    lat: candidate.lat,
+    lon: candidate.lon,
+    name: candidate.name || `Point ${index}`,
+    index,
+    collected: false,
+    collectedAt: null,
+    distFromStart: Math.round(distFromStart),
+    weight: Math.max(10, Math.round(10 + distFromStart / 50)), // farther = worth more, for Score Attack
+  };
+}
+
 export async function generatePoints(center, settings) {
   const { layout, radiusKm, distanceKm, numPoints, minSpacing, maxSpacing, style } = settings;
 
@@ -98,45 +113,64 @@ export async function generatePoints(center, settings) {
   // If OSM data can't be reached at all (the public Overpass mirrors are down/rate-limited),
   // fall back to synthetic random placement rather than failing the run outright — the
   // caller is told via `usedFallback` so it can let the user know why.
+  // `pool` (the full fetched candidate set, usually far larger than numPoints) is kept and
+  // handed back so a later "reroll this point" can reuse it instead of hitting the network again.
   let source;
+  let pool = null;
   let usedFallback = false;
   if (style === 'random') {
     source = makeSyntheticSource(center, effectiveRadiusM);
   } else {
     const fetchNodes = style === 'path' ? fetchPathNodes : fetchPOINodes;
-    let pool = [];
+    let fetchedPool = [];
     try {
       const nodes = await fetchNodes(center.lat, center.lon, effectiveRadiusM);
-      pool = nodes.filter((n) => haversine(center.lat, center.lon, n.lat, n.lon) >= MIN_DIST_FROM_START);
+      fetchedPool = nodes.filter((n) => haversine(center.lat, center.lon, n.lat, n.lon) >= MIN_DIST_FROM_START);
     } catch (e) {
       console.warn('OSM data unavailable, falling back to random placement:', e.message);
       usedFallback = true;
     }
-    source = pool.length ? makePoolSource(pool) : makeSyntheticSource(center, effectiveRadiusM);
-    if (!pool.length) usedFallback = true;
+    pool = fetchedPool;
+    source = fetchedPool.length ? makePoolSource(fetchedPool) : makeSyntheticSource(center, effectiveRadiusM);
+    if (!fetchedPool.length) usedFallback = true;
   }
 
   let picked = selectSpaced(source, numPoints, minSpacing, maxSpacing);
 
+  let loopGeometry = null;
   if (layout === 'loop' && picked.length >= 3) {
-    const order = await orderAsLoop(picked);
+    const { order, geometry } = await orderAsLoop(picked);
     picked = order.map((i) => picked[i]);
+    loopGeometry = geometry;
   }
 
-  const points = picked.map((p, i) => {
-    const distFromStart = haversine(center.lat, center.lon, p.lat, p.lon);
-    return {
-      id: `p${i}_${Math.round(p.lat * 1e6)}_${Math.round(p.lon * 1e6)}`,
-      lat: p.lat,
-      lon: p.lon,
-      name: p.name || `Point ${i + 1}`,
-      index: i + 1,
-      collected: false,
-      collectedAt: null,
-      distFromStart: Math.round(distFromStart),
-      weight: Math.max(10, Math.round(10 + distFromStart / 50)), // farther = worth more, for Score Attack
-    };
-  });
+  const points = picked.map((p, i) => toPoint(p, i + 1, center));
 
-  return { points, usedFallback };
+  return { points, usedFallback, loopGeometry, rerollContext: { pool, effectiveRadiusM } };
+}
+
+// Swaps one point for a freshly chosen one nearby, respecting spacing against the
+// *other* current points. Reuses the leftover OSM candidate pool from the original
+// generation pass when available (no extra network round-trip); falls back to a
+// synthetic random point otherwise — always succeeds, never blocks on a network call.
+export function rerollPoint(target, allPoints, center, settings, rerollContext) {
+  const { pool, effectiveRadiusM } = rerollContext;
+  const others = allPoints.filter((p) => p.id !== target.id);
+  const usedKeys = new Set(others.map((p) => `${p.lat.toFixed(6)},${p.lon.toFixed(6)}`));
+  const respectsSpacing = (cand) => others.every((p) => haversine(p.lat, p.lon, cand.lat, cand.lon) >= settings.minSpacing);
+
+  let chosen = null;
+  if (settings.style !== 'random' && pool?.length) {
+    const available = shuffle(pool.filter((c) => !usedKeys.has(`${c.lat.toFixed(6)},${c.lon.toFixed(6)}`)));
+    chosen = available.find(respectsSpacing) || available[0] || null;
+  }
+  if (!chosen) {
+    for (let i = 0; i < 40; i++) {
+      const cand = randomInDisk(center, effectiveRadiusM);
+      chosen = cand;
+      if (respectsSpacing(cand)) break;
+    }
+  }
+
+  return toPoint(chosen, target.index, center);
 }
