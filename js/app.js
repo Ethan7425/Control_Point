@@ -15,7 +15,7 @@ import { pushRun, deleteRemoteRun, pullAndMergeRuns, pushAllLocalRuns } from './
 // ---------- version ----------
 // Bump this on every push — it's the quickest way to confirm a device is actually
 // running the latest deploy (shown small next to the app name in the header).
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.1.1';
 document.getElementById('app-version').textContent = `v${APP_VERSION}`;
 console.log(`Control Point v${APP_VERSION}`);
 
@@ -458,10 +458,23 @@ function escapeHtml(s) {
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-function pointIcon(p) {
+// Sequential (Loop) runs have three point states, not two: collected (green),
+// active — the one point you can actually reach right now (amber, pulsing),
+// and locked — later in the sequence, not reachable yet (muted, static). Free
+// (Scatter) runs only ever have collected/active, exactly like before.
+function pointStateAt(idx) {
+  const p = runController.points[idx];
+  if (p.collected) return 'collected';
+  if (!runController.sequential) return 'active';
+  const nextIdx = runController.points.findIndex((pt) => !pt.collected);
+  return idx === nextIdx ? 'active' : 'locked';
+}
+
+function pointIcon(p, state) {
+  const cls = state === 'collected' ? 'collected' : state === 'locked' ? 'locked' : 'uncollected';
   return L.divIcon({
     className: '',
-    html: `<div class="cp-dot ${p.collected ? 'collected' : 'uncollected'}" style="width:22px;height:22px;display:flex;align-items:center;justify-content:center;color:#06210f;font-weight:700;font-size:11px;">${p.index}</div>`,
+    html: `<div class="cp-dot ${cls}" style="width:22px;height:22px;display:flex;align-items:center;justify-content:center;color:#06170f;font-weight:700;font-size:11px;">${p.index}</div>`,
     iconSize: [22, 22],
     iconAnchor: [11, 11],
   });
@@ -488,11 +501,12 @@ function radarIcon() {
 }
 
 // Visual reminder of exactly how close a point needs to be to collect it —
-// glows amber while uncollected, settles to a dim green ring once collected.
-function circleStyle(collected) {
-  return collected
-    ? { color: '#22c55e', weight: 2, fillColor: '#22c55e', fillOpacity: 0.06, opacity: 0.35 }
-    : { color: '#f59e0b', weight: 3, fillColor: '#f59e0b', fillOpacity: 0.16, opacity: 0.85 };
+// glows amber while it's the one you can actually reach, dims to a muted ring
+// while locked (sequential runs only), settles to a dim green ring once collected.
+function circleStyle(state) {
+  if (state === 'collected') return { color: '#33c48d', weight: 2, fillColor: '#33c48d', fillOpacity: 0.06, opacity: 0.35 };
+  if (state === 'locked') return { color: '#5c6975', weight: 1, fillColor: '#5c6975', fillOpacity: 0.03, opacity: 0.2 };
+  return { color: '#e0a64b', weight: 3, fillColor: '#e0a64b', fillOpacity: 0.16, opacity: 0.85 };
 }
 
 // Plain HTML buttons (not Leaflet controls) sitting OUTSIDE the map's rotating
@@ -627,12 +641,20 @@ document.getElementById('compass-toggle-btn').addEventListener('click', () => {
 
 // Tapping a point shows its name and, if it's still uncollected, a "Reroll this
 // point" button — for when the generator drops one somewhere genuinely awkward.
-function bindPointPopup(marker, point) {
-  const html = point.collected
-    ? `<div class="cp-popup"><strong>${escapeHtml(point.name)}</strong><br><span class="cp-popup-status">Collected ✓</span></div>`
-    : `<div class="cp-popup"><strong>${escapeHtml(point.name)}</strong><br><button type="button" class="cp-popup-reroll" data-id="${point.id}">Reroll this point</button></div>`;
+// Locked (sequential, not-yet-reachable) points get a status line explaining why,
+// but rerolling is still allowed — it doesn't affect turn order, just location.
+function bindPointPopup(marker, point, state) {
+  let statusHtml;
+  if (state === 'collected') statusHtml = `<span class="cp-popup-status">Collected ✓</span>`;
+  else if (state === 'locked') statusHtml = `<span class="cp-popup-status cp-popup-locked">Reach the earlier points first</span>`;
+  else statusHtml = '';
+
+  const rerollHtml = state === 'collected'
+    ? ''
+    : `<button type="button" class="cp-popup-reroll" data-id="${point.id}">Reroll this point</button>`;
+
   marker.unbindPopup();
-  marker.bindPopup(html);
+  marker.bindPopup(`<div class="cp-popup"><strong>${escapeHtml(point.name)}</strong><br>${statusHtml}${rerollHtml}</div>`);
   marker.off('popupopen');
   marker.on('popupopen', () => {
     marker.getPopup()?.getElement()?.querySelector('.cp-popup-reroll')?.addEventListener('click', () => handleReroll(point.id));
@@ -648,13 +670,14 @@ function handleReroll(pointId) {
   const newPoint = rerollPoint(target, runController.points, currentCenter, runController.settings, currentRerollContext);
   runController.replacePoint(target.id, newPoint);
 
+  const state = pointStateAt(idx); // location changed, but sequence position/state didn't
   map.closePopup();
   map.removeLayer(pointMarkers[idx]);
   map.removeLayer(pointCircles[idx]);
-  pointMarkers[idx] = L.marker([newPoint.lat, newPoint.lon], { icon: pointIcon(newPoint) }).addTo(map);
-  bindPointPopup(pointMarkers[idx], newPoint);
+  pointMarkers[idx] = L.marker([newPoint.lat, newPoint.lon], { icon: pointIcon(newPoint, state) }).addTo(map);
+  bindPointPopup(pointMarkers[idx], newPoint, state);
   pointCircles[idx] = L.circle([newPoint.lat, newPoint.lon], {
-    radius: COLLECT_RADIUS_M, className: 'cp-radius-glow', ...circleStyle(false),
+    radius: COLLECT_RADIUS_M, className: state === 'active' ? 'cp-radius-glow' : '', ...circleStyle(state),
   }).addTo(map);
   map.panTo([newPoint.lat, newPoint.lon], { animate: true }); // bring the new spot into view instead of leaving it off-screen
 
@@ -708,18 +731,19 @@ function startRunSession(center, settings, points, usedFallback, loopGeometry, r
     }).addTo(map);
   }
 
-  pointMarkers = points.map((p) => {
-    const marker = L.marker([p.lat, p.lon], { icon: pointIcon(p) }).addTo(map);
-    bindPointPopup(marker, p);
+  pointMarkers = points.map((p, idx) => {
+    const marker = L.marker([p.lat, p.lon], { icon: pointIcon(p, pointStateAt(idx)) }).addTo(map);
+    bindPointPopup(marker, p, pointStateAt(idx));
     return marker;
   });
-  pointCircles = points.map((p) =>
-    L.circle([p.lat, p.lon], {
+  pointCircles = points.map((p, idx) => {
+    const state = pointStateAt(idx);
+    return L.circle([p.lat, p.lon], {
       radius: COLLECT_RADIUS_M,
-      className: p.collected ? '' : 'cp-radius-glow',
-      ...circleStyle(p.collected),
-    }).addTo(map)
-  );
+      className: state === 'active' ? 'cp-radius-glow' : '',
+      ...circleStyle(state),
+    }).addTo(map);
+  });
   const initialRoute = resumeState ? runController.route.map((r) => [r.lat, r.lon]) : [[center.lat, center.lon]];
   routeLine = L.polyline(initialRoute, { color: '#3b82f6', weight: 4, opacity: 0.85 }).addTo(map);
   userRadar = L.marker([center.lat, center.lon], { icon: radarIcon(), interactive: false, zIndexOffset: 900 }).addTo(map);
@@ -762,12 +786,26 @@ function onPositionUpdate(pos) {
 
   if (collected) {
     const idx = runController.points.findIndex((p) => p.id === collected.id);
-    pointMarkers[idx]?.setIcon(pointIcon(collected));
-    if (pointMarkers[idx]) bindPointPopup(pointMarkers[idx], collected); // drop the reroll option once collected
-    pointCircles[idx]?.setStyle(circleStyle(true));
+    pointMarkers[idx]?.setIcon(pointIcon(collected, 'collected'));
+    if (pointMarkers[idx]) bindPointPopup(pointMarkers[idx], collected, 'collected'); // drop the reroll option once collected
+    pointCircles[idx]?.setStyle(circleStyle('collected'));
     pointCircles[idx]?.getElement()?.classList.remove('cp-radius-glow');
     showToast(`Collected: ${collected.name} (+${collected.weight})`);
     feedbackCollect();
+
+    // Sequential runs: whichever point just became next-in-line needs to switch
+    // from locked to active — glowing ring, popup no longer says "reach earlier
+    // points first".
+    if (runController.sequential) {
+      const nextIdx = runController.points.findIndex((p) => !p.collected);
+      if (nextIdx !== -1) {
+        const nextPoint = runController.points[nextIdx];
+        pointMarkers[nextIdx]?.setIcon(pointIcon(nextPoint, 'active'));
+        bindPointPopup(pointMarkers[nextIdx], nextPoint, 'active');
+        pointCircles[nextIdx]?.setStyle(circleStyle('active'));
+        pointCircles[nextIdx]?.getElement()?.classList.add('cp-radius-glow');
+      }
+    }
   }
 
   updateStatBar();
@@ -814,16 +852,22 @@ function updateNextPointIndicator() {
   }
 
   const [lat, lon] = lastKnownLatLng;
-  let nearest = uncollected[0];
-  let nearestDist = haversine(lat, lon, nearest.lat, nearest.lon);
-  for (const p of uncollected.slice(1)) {
-    const d = haversine(lat, lon, p.lat, p.lon);
-    if (d < nearestDist) { nearest = p; nearestDist = d; }
+  let target;
+  if (runController.sequential) {
+    target = uncollected[0]; // must go here next, regardless of what's physically closer
+  } else {
+    target = uncollected[0];
+    let nearestDist = haversine(lat, lon, target.lat, target.lon);
+    for (const p of uncollected.slice(1)) {
+      const d = haversine(lat, lon, p.lat, p.lon);
+      if (d < nearestDist) { target = p; nearestDist = d; }
+    }
   }
 
-  const dir = compassDirection(bearing(lat, lon, nearest.lat, nearest.lon));
-  const distText = nearestDist >= 1000 ? `${(nearestDist / 1000).toFixed(2)} km` : `${Math.round(nearestDist)} m`;
-  el.textContent = `→ Point ${nearest.index}: ${distText} ${dir}`;
+  const dist = haversine(lat, lon, target.lat, target.lon);
+  const dir = compassDirection(bearing(lat, lon, target.lat, target.lon));
+  const distText = dist >= 1000 ? `${(dist / 1000).toFixed(2)} km` : `${Math.round(dist)} m`;
+  el.textContent = `→ Point ${target.index}: ${distText} ${dir}`;
   el.classList.remove('hidden');
 }
 

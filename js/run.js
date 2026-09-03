@@ -12,6 +12,9 @@ export class RunController {
     this.settings = settings;
     this.points = points; // array from points.js, mutated in place as collected/rerolled
     this.loopGeometry = loopGeometry; // suggested route line for Loop layout, or null
+    // Loop layout is a structured course: points must be collected in order (index
+    // 1, 2, 3...), not whichever uncollected point you happen to reach first.
+    this.sequential = settings.layout === 'loop';
     this.route = []; // [{lat, lon, t, alt}]
     this.distanceM = 0;
     this.elevationGainM = 0;
@@ -85,7 +88,14 @@ export class RunController {
     let justCollected = null;
     const scoreLocked = this.settings.mode === 'scoreAttack' && this.isTimeUp();
     if (!scoreLocked) {
-      for (const p of this.points) {
+      // Sequential (Loop): only the next point in order can ever be collected —
+      // being physically near a later point does nothing until you've reached
+      // everything before it. Free-form (Scatter): any uncollected point works,
+      // same as always.
+      const candidates = this.sequential
+        ? this.points.filter((p) => !p.collected).slice(0, 1)
+        : this.points;
+      for (const p of candidates) {
         if (p.collected) continue;
         const d = haversine(lat, lon, p.lat, p.lon);
         if (d <= COLLECT_RADIUS_M) {

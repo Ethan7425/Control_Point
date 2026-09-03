@@ -494,6 +494,7 @@ input[type="range"]::-moz-range-thumb {
 }
 .cp-dot.uncollected { background: var(--warn); }
 .cp-dot.collected { background: var(--accent); opacity: 0.55; animation: cp-pop 0.45s ease-out; }
+.cp-dot.locked { background: var(--bg-elev-3); color: var(--text-faint) !important; opacity: 0.7; box-shadow: 0 0 0 3px rgba(255,255,255,0.05); }
 .cp-user-dot { background: var(--info); border-radius: 50%; border: 3px solid #fff; box-shadow: 0 0 0 6px rgba(91,143,232,0.22); }
 
 /* Decorative radar sweep around the live position — purely for atmosphere. */
@@ -548,6 +549,7 @@ input[type="range"]::-moz-range-thumb {
 .leaflet-popup-content { margin: 10px 12px; font-size: 13px; font-family: var(--font-body); }
 .leaflet-popup-close-button { color: var(--text-dim) !important; }
 .cp-popup-status { color: var(--accent); font-weight: 600; }
+.cp-popup-status.cp-popup-locked { color: var(--text-faint); font-weight: 500; }
 .cp-popup-reroll {
   margin-top: 6px;
   background: var(--bg-elev-2);

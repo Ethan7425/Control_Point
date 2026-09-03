@@ -3,15 +3,18 @@
 // perfectly efficient layout — some randomness/dead-ends are intentional.
 
 import { haversine, destinationPoint } from './geo.js';
-import { fetchPathNodes, fetchPOINodes, orderAsLoop } from './overpass.js';
+import { fetchPathNodes, fetchPOINodes, planSequentialLoop } from './overpass.js';
 
 const MIN_DIST_FROM_START = 25; // don't drop a point right on top of the user
+const FINISH_MIN_DIST = 40; // the loop's last point sits this far from start...
+const FINISH_MAX_DIST = 90; // ...to this far — close enough to read as "back home",
+                             // far enough that it isn't trivially the same spot as point 1
 
-function randomInDisk(center, radiusM) {
+function randomInDisk(center, radiusM, minDist = MIN_DIST_FROM_START) {
   const bearing = Math.random() * 360;
   // sqrt() keeps the distribution uniform over area, not biased toward the center
-  const dist = MIN_DIST_FROM_START + Math.sqrt(Math.random()) * (radiusM - MIN_DIST_FROM_START);
-  return destinationPoint(center.lat, center.lon, bearing, Math.max(dist, MIN_DIST_FROM_START));
+  const dist = minDist + Math.sqrt(Math.random()) * Math.max(radiusM - minDist, 0);
+  return destinationPoint(center.lat, center.lon, bearing, Math.max(dist, minDist));
 }
 
 function shuffle(arr) {
@@ -27,6 +30,7 @@ function shuffle(arr) {
 // possible, relaxing the constraints if the candidate source runs dry.
 function selectSpaced(candidateSource, numPoints, minSpacing, maxSpacing) {
   const accepted = [];
+  if (numPoints <= 0) return accepted;
 
   const nearestDist = (pt) =>
     accepted.length === 0 ? Infinity : Math.min(...accepted.map((p) => haversine(p.lat, p.lon, pt.lat, pt.lon)));
@@ -87,6 +91,27 @@ function makePoolSource(pool) {
   return source;
 }
 
+// Fetches the style-appropriate candidate pool/source for a given area — shared
+// by both the scatter layout and the sequential loop's "middle" points.
+async function buildSource(center, effectiveRadiusM, style) {
+  if (style === 'random') {
+    return { source: makeSyntheticSource(center, effectiveRadiusM), pool: null, usedFallback: false };
+  }
+  const fetchNodes = style === 'path' ? fetchPathNodes : fetchPOINodes;
+  let fetchedPool = [];
+  let usedFallback = false;
+  try {
+    const nodes = await fetchNodes(center.lat, center.lon, effectiveRadiusM);
+    fetchedPool = nodes.filter((n) => haversine(center.lat, center.lon, n.lat, n.lon) >= MIN_DIST_FROM_START);
+  } catch (e) {
+    console.warn('OSM data unavailable, falling back to random placement:', e.message);
+    usedFallback = true;
+  }
+  const source = fetchedPool.length ? makePoolSource(fetchedPool) : makeSyntheticSource(center, effectiveRadiusM);
+  if (!fetchedPool.length) usedFallback = true;
+  return { source, pool: fetchedPool, usedFallback };
+}
+
 function toPoint(candidate, index, center) {
   const distFromStart = haversine(center.lat, center.lon, candidate.lat, candidate.lon);
   return {
@@ -105,48 +130,57 @@ function toPoint(candidate, index, center) {
 export async function generatePoints(center, settings) {
   const { layout, radiusKm, distanceKm, numPoints, minSpacing, maxSpacing, style } = settings;
 
-  const effectiveRadiusM =
-    layout === 'loop'
-      ? (distanceKm * 1000) / (2 * Math.PI) * (0.85 + Math.random() * 0.3) // organic, not a perfect circle
-      : radiusKm * 1000;
+  if (layout === 'loop') return generateSequentialLoop(center, settings);
 
-  // If OSM data can't be reached at all (the public Overpass mirrors are down/rate-limited),
-  // fall back to synthetic random placement rather than failing the run outright — the
-  // caller is told via `usedFallback` so it can let the user know why.
-  // `pool` (the full fetched candidate set, usually far larger than numPoints) is kept and
-  // handed back so a later "reroll this point" can reuse it instead of hitting the network again.
-  let source;
-  let pool = null;
-  let usedFallback = false;
-  if (style === 'random') {
-    source = makeSyntheticSource(center, effectiveRadiusM);
-  } else {
-    const fetchNodes = style === 'path' ? fetchPathNodes : fetchPOINodes;
-    let fetchedPool = [];
-    try {
-      const nodes = await fetchNodes(center.lat, center.lon, effectiveRadiusM);
-      fetchedPool = nodes.filter((n) => haversine(center.lat, center.lon, n.lat, n.lon) >= MIN_DIST_FROM_START);
-    } catch (e) {
-      console.warn('OSM data unavailable, falling back to random placement:', e.message);
-      usedFallback = true;
-    }
-    pool = fetchedPool;
-    source = fetchedPool.length ? makePoolSource(fetchedPool) : makeSyntheticSource(center, effectiveRadiusM);
-    if (!fetchedPool.length) usedFallback = true;
-  }
-
-  let picked = selectSpaced(source, numPoints, minSpacing, maxSpacing);
-
-  let loopGeometry = null;
-  if (layout === 'loop' && picked.length >= 1) {
-    const { order, geometry } = await orderAsLoop(picked, center);
-    picked = order.map((i) => picked[i]);
-    loopGeometry = geometry;
-  }
-
+  const effectiveRadiusM = radiusKm * 1000;
+  const { source, pool, usedFallback } = await buildSource(center, effectiveRadiusM, style);
+  const picked = selectSpaced(source, numPoints, minSpacing, maxSpacing);
   const points = picked.map((p, i) => toPoint(p, i + 1, center));
 
-  return { points, usedFallback, loopGeometry, rerollContext: { pool, effectiveRadiusM } };
+  return { points, usedFallback, loopGeometry: null, rerollContext: { pool, effectiveRadiusM } };
+}
+
+// A structured course, not a free scatter: point 1 is where you start (collected
+// automatically — you're already there), the last point sits a short, deliberate
+// distance from start (so it isn't trivially the same spot as point 1), and the
+// points in between are visited strictly in order. Collection order is enforced
+// by RunController, not here — this just decides *what* that order is.
+async function generateSequentialLoop(center, settings) {
+  const { distanceKm, numPoints, minSpacing, maxSpacing, style } = settings;
+  const effectiveRadiusM = (distanceKm * 1000) / (2 * Math.PI) * (0.85 + Math.random() * 0.3); // organic, not a perfect circle
+  const middleCount = Math.max(0, numPoints - 2);
+
+  const { source, pool, usedFallback } = await buildSource(center, effectiveRadiusM, style);
+  const middleCandidates = selectSpaced(source, middleCount, minSpacing, maxSpacing);
+  const finishCandidate = randomInDisk(center, FINISH_MAX_DIST, FINISH_MIN_DIST);
+
+  let orderedMiddle = middleCandidates;
+  let loopGeometry = null;
+  try {
+    const { order, geometry } = await planSequentialLoop(middleCandidates, center, finishCandidate);
+    orderedMiddle = order.map((i) => middleCandidates[i]);
+    loopGeometry = geometry;
+  } catch (e) {
+    console.warn('Sequential loop planning failed, using unordered middle points:', e.message);
+  }
+
+  const allCandidates = [{ ...center, name: 'Start' }, ...orderedMiddle, { ...finishCandidate, name: 'Finish' }];
+  const points = allCandidates.map((p, i) => toPoint(p, i + 1, center));
+  points[0].collected = true; // you're standing on it by definition
+  points[0].collectedAt = Date.now();
+
+  return {
+    points,
+    usedFallback,
+    loopGeometry,
+    rerollContext: {
+      pool, effectiveRadiusM,
+      sequential: true,
+      finishAnchor: center,
+      finishMinDist: FINISH_MIN_DIST,
+      finishMaxDist: FINISH_MAX_DIST,
+    },
+  };
 }
 
 // Swaps one point for a freshly chosen one nearby, respecting spacing against the
@@ -154,23 +188,32 @@ export async function generatePoints(center, settings) {
 // generation pass when available (no extra network round-trip); falls back to a
 // synthetic random point otherwise — always succeeds, never blocks on a network call.
 export function rerollPoint(target, allPoints, center, settings, rerollContext) {
-  const { pool, effectiveRadiusM } = rerollContext;
+  const { pool, effectiveRadiusM, sequential, finishAnchor, finishMinDist, finishMaxDist } = rerollContext;
   const others = allPoints.filter((p) => p.id !== target.id);
   const usedKeys = new Set(others.map((p) => `${p.lat.toFixed(6)},${p.lon.toFixed(6)}`));
   const respectsSpacing = (cand) => others.every((p) => haversine(p.lat, p.lon, cand.lat, cand.lon) >= settings.minSpacing);
 
+  // The loop's finish point has its own tight "near start" placement rule — reroll
+  // must respect that too, or it could end up anywhere in the full loop radius.
+  const isFinishPoint = sequential && target.index === allPoints.length;
+
   let chosen = null;
-  if (settings.style !== 'random' && pool?.length) {
+  if (!isFinishPoint && settings.style !== 'random' && pool?.length) {
     const available = shuffle(pool.filter((c) => !usedKeys.has(`${c.lat.toFixed(6)},${c.lon.toFixed(6)}`)));
     chosen = available.find(respectsSpacing) || available[0] || null;
   }
   if (!chosen) {
+    const anchor = isFinishPoint ? finishAnchor : center;
+    const maxDist = isFinishPoint ? finishMaxDist : effectiveRadiusM;
+    const minDist = isFinishPoint ? finishMinDist : undefined;
     for (let i = 0; i < 40; i++) {
-      const cand = randomInDisk(center, effectiveRadiusM);
+      const cand = randomInDisk(anchor, maxDist, minDist);
       chosen = cand;
       if (respectsSpacing(cand)) break;
     }
   }
 
-  return toPoint(chosen, target.index, center);
+  const point = toPoint(chosen, target.index, center);
+  if (isFinishPoint) point.name = 'Finish';
+  return point;
 }
