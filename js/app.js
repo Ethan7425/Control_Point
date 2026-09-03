@@ -15,7 +15,7 @@ import { pushRun, deleteRemoteRun, pullAndMergeRuns, pushAllLocalRuns } from './
 // ---------- version ----------
 // Bump this on every push — it's the quickest way to confirm a device is actually
 // running the latest deploy (shown small next to the app name in the header).
-const APP_VERSION = '1.1.1';
+const APP_VERSION = '1.1.2';
 document.getElementById('app-version').textContent = `v${APP_VERSION}`;
 console.log(`Control Point v${APP_VERSION}`);
 

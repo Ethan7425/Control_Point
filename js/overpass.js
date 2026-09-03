@@ -43,6 +43,11 @@ async function runQuery(ql) {
 
 // All walkable-way nodes within `radiusM` of center. One query covers the whole run
 // instead of one query per point, which is both faster and kinder to the public API.
+//
+// Dead-end tips (a node with only one neighbor in the fetched network — the end of
+// a spur, driveway, or cul-de-sac) are filtered out: reaching one of those forces
+// walking in and back out the same way, which is exactly the "20m out-and-back"
+// pattern we want the point picker to avoid. A through node always has 2+ neighbors.
 export async function fetchPathNodes(lat, lon, radiusM) {
   const ql = `
     [out:json][timeout:25];
@@ -51,9 +56,36 @@ export async function fetchPathNodes(lat, lon, radiusM) {
     out skel qt;
   `;
   const data = await runQuery(ql);
-  return (data.elements || [])
-    .filter((el) => el.type === 'node' && el.lat != null && el.lon != null)
-    .map((n) => ({ lat: n.lat, lon: n.lon }));
+  const elements = data.elements || [];
+
+  const nodeById = new Map();
+  const ways = [];
+  for (const el of elements) {
+    if (el.type === 'node' && el.lat != null && el.lon != null) {
+      nodeById.set(el.id, { lat: el.lat, lon: el.lon });
+    } else if (el.type === 'way' && Array.isArray(el.nodes)) {
+      ways.push(el.nodes);
+    }
+  }
+
+  const neighborCount = new Map(); // nodeId -> Set of distinct adjacent nodeIds
+  const addEdge = (a, b) => {
+    if (!neighborCount.has(a)) neighborCount.set(a, new Set());
+    if (!neighborCount.has(b)) neighborCount.set(b, new Set());
+    neighborCount.get(a).add(b);
+    neighborCount.get(b).add(a);
+  };
+  for (const nodes of ways) {
+    for (let i = 0; i < nodes.length - 1; i++) addEdge(nodes[i], nodes[i + 1]);
+  }
+
+  const out = [];
+  for (const [id, coords] of nodeById) {
+    const degree = neighborCount.get(id)?.size ?? 0;
+    if (degree <= 1) continue; // dead-end spur tip — skip as a target
+    out.push(coords);
+  }
+  return out;
 }
 
 // POI nodes (amenity/shop/tourism/leisure) within radiusM of center.
