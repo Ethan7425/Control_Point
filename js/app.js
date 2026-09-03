@@ -1,5 +1,6 @@
 import { getCurrentPosition, GeoWatcher, bearing, compassDirection, haversine, destinationPoint } from './geo.js';
 import { generatePoints, rerollPoint } from './points.js';
+import { prefetchTiles } from './tilecache.js';
 import { RunController, COLLECT_RADIUS_M } from './run.js';
 import { saveRun, getAllRuns, getRun, deleteRun } from './db.js';
 import { renderRunRecap, renderHistoryList, renderHistorySummary, fmtTime } from './render.js';
@@ -15,7 +16,7 @@ import { pushRun, deleteRemoteRun, pullAndMergeRuns, pushAllLocalRuns } from './
 // ---------- version ----------
 // Bump this on every push — it's the quickest way to confirm a device is actually
 // running the latest deploy (shown small next to the app name in the header).
-const APP_VERSION = '1.2.0';
+const APP_VERSION = '1.3.0';
 document.getElementById('app-version').textContent = `v${APP_VERSION}`;
 console.log(`Control Point v${APP_VERSION}`);
 
@@ -297,6 +298,7 @@ function updateAreaMapRadius() {
   const edge = edgePosFor({ lat: c.lat, lon: c.lng }, r);
   areaEdgeMarker.setLatLng([edge.lat, edge.lon]);
   fitAreaMapToCircle();
+  resetTileDownloadStatus(); // area changed — a stale "ready for offline use" would be misleading
 }
 ['radius', 'distance'].forEach((id) => document.getElementById(id).addEventListener('input', updateAreaMapRadius));
 
@@ -350,6 +352,7 @@ async function initAreaMap() {
     const c = areaCenterMarker.getLatLng();
     areaOverrideCenter = { lat: c.lat, lon: c.lng };
     fitAreaMapToCircle();
+    resetTileDownloadStatus();
   });
 
   areaEdgeMarker.on('drag', () => {
@@ -379,6 +382,60 @@ document.getElementById('area-recenter-btn').addEventListener('click', async () 
   areaCenterMarker.setLatLng([areaTrueLoc.lat, areaTrueLoc.lon]);
   areaCircle.setLatLng([areaTrueLoc.lat, areaTrueLoc.lon]);
   updateAreaMapRadius(); // also re-fits the view to the circle
+});
+
+// ---------- offline tile pre-caching ----------
+// Downloads the map tiles for the current search area into Cache Storage right now,
+// while you (hopefully) still have good signal — so the map keeps rendering during
+// the actual run even through a dead zone. Independent of starting a run: meant to be
+// done ahead of time, e.g. at home on wifi before you head out.
+let tilePrefetchAbort = null;
+const tileDownloadBtn = document.getElementById('area-download-btn');
+const tileDownloadStatus = document.getElementById('area-download-status');
+
+function resetTileDownloadStatus() {
+  if (tilePrefetchAbort) return; // don't clobber an in-progress download's live status
+  tileDownloadStatus.textContent = '';
+}
+
+tileDownloadBtn.addEventListener('click', async () => {
+  if (tilePrefetchAbort) {
+    tilePrefetchAbort.abort();
+    tilePrefetchAbort = null;
+    tileDownloadBtn.textContent = 'Download map for offline use';
+    tileDownloadStatus.textContent = 'Cancelled.';
+    return;
+  }
+
+  const center = areaOverrideCenter || areaTrueLoc;
+  if (!center) {
+    tileDownloadStatus.textContent = 'Location unavailable — wait for the map above to load first.';
+    return;
+  }
+
+  tilePrefetchAbort = new AbortController();
+  tileDownloadBtn.textContent = 'Cancel download';
+  tileDownloadStatus.textContent = 'Starting…';
+  try {
+    const result = await prefetchTiles(center, currentPreviewRadiusM(), {
+      signal: tilePrefetchAbort.signal,
+      onProgress: ({ done, failed, total }) => {
+        tileDownloadStatus.textContent = `Caching tiles… ${done}/${total}${failed ? ` (${failed} failed)` : ''}`;
+      },
+    });
+    if (result.aborted) {
+      tileDownloadStatus.textContent = 'Cancelled.';
+    } else if (result.failed) {
+      tileDownloadStatus.textContent = `Cached ${result.done - result.failed}/${result.total} tiles (${result.failed} failed — check your connection).`;
+    } else {
+      tileDownloadStatus.textContent = `Ready for offline use — ${result.done} tiles cached.`;
+    }
+  } catch (e) {
+    tileDownloadStatus.textContent = `Couldn’t download tiles: ${e.message}`;
+  } finally {
+    tilePrefetchAbort = null;
+    tileDownloadBtn.textContent = 'Download map for offline use';
+  }
 });
 
 // ---------- settings persistence (remembers your last-used setup across visits) ----------
