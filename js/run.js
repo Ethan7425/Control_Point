@@ -5,14 +5,18 @@
 import { haversine } from './geo.js';
 
 export const COLLECT_RADIUS_M = 20; // GPS in cities is often ±10m; 15-25m avoids false negatives
+const MIN_ELEV_DELTA_M = 3; // GPS altitude is noisy (often ±10-30m); ignore jitter below this
 
 export class RunController {
   constructor(settings, points, startPosition, loopGeometry = null) {
     this.settings = settings;
     this.points = points; // array from points.js, mutated in place as collected/rerolled
     this.loopGeometry = loopGeometry; // suggested route line for Loop layout, or null
-    this.route = []; // [{lat, lon, t}]
+    this.route = []; // [{lat, lon, t, alt}]
     this.distanceM = 0;
+    this.elevationGainM = 0;
+    this.elevationLossM = 0;
+    this._lastStableAlt = null;
     this.startedAt = Date.now();
     this.endedAt = null;
     this.ended = false;
@@ -30,18 +34,53 @@ export class RunController {
     return true;
   }
 
-  _pushRoutePoint(lat, lon) {
+  // Rebuilds state after the page was reloaded mid-run — e.g. the OS fully killed a
+  // backgrounded tab, wiping all JS memory. Restores the saved route/distance/start
+  // time, then appends a fresh GPS fix so the route continues seamlessly from here
+  // instead of drawing a straight line across however long the app was closed.
+  resumeFrom(saved, freshLat, freshLon, freshAlt) {
+    this.route = saved.route;
+    this.distanceM = saved.distanceM;
+    this.elevationGainM = saved.elevationGainM || 0;
+    this.elevationLossM = saved.elevationLossM || 0;
+    this._lastStableAlt = saved.route[saved.route.length - 1]?.alt ?? null;
+    this.startedAt = saved.startedAt;
+    if (freshLat != null && freshLon != null) this._pushRoutePoint(freshLat, freshLon, freshAlt);
+  }
+
+  _pushRoutePoint(lat, lon, alt) {
     const prev = this.route[this.route.length - 1];
     if (prev) {
       this.distanceM += haversine(prev.lat, prev.lon, lat, lon);
     }
-    this.route.push({ lat, lon, t: Date.now() });
+    this.route.push({ lat, lon, t: Date.now(), alt: alt ?? null });
+
+    // A simple noise gate: only bank a gain/loss once altitude has actually moved
+    // past the jitter floor, so GPS wobble doesn't inflate elevation gain to
+    // absurd totals over a long run (a very common real-world GPS-elevation bug).
+    if (typeof alt === 'number' && !Number.isNaN(alt)) {
+      if (this._lastStableAlt == null) {
+        this._lastStableAlt = alt;
+      } else {
+        const delta = alt - this._lastStableAlt;
+        if (Math.abs(delta) >= MIN_ELEV_DELTA_M) {
+          if (delta > 0) this.elevationGainM += delta;
+          else this.elevationLossM += -delta;
+          this._lastStableAlt = alt;
+        }
+      }
+    } else {
+      // Altitude unavailable this tick (common under tree cover / urban canyons) —
+      // clear the reference so the next valid reading starts a fresh baseline
+      // instead of diffing against a now-stale altitude from before the gap.
+      this._lastStableAlt = null;
+    }
   }
 
   // Called on every geolocation update. Returns the point just collected, if any.
-  tick(lat, lon) {
+  tick(lat, lon, alt) {
     if (this.ended) return null;
-    this._pushRoutePoint(lat, lon);
+    this._pushRoutePoint(lat, lon, alt);
 
     let justCollected = null;
     const scoreLocked = this.settings.mode === 'scoreAttack' && this.isTimeUp();
@@ -100,6 +139,8 @@ export class RunController {
       endedAt: this.endedAt,
       totalMs,
       distanceM: Math.round(this.distanceM),
+      elevationGainM: Math.round(this.elevationGainM),
+      elevationLossM: Math.round(this.elevationLossM),
       paceMinPerKm,
       pointsTotal: this.points.length,
       pointsCollected: this.pointsCollected(),

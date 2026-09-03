@@ -1,7 +1,7 @@
 // App-shell cache so the PWA installs and opens offline. Live data (Overpass,
 // OSRM, GPS) is always network-only — only the shell and map tiles are cached.
 
-const SHELL_CACHE = 'control-point-shell-v15';
+const SHELL_CACHE = 'control-point-shell-v23';
 const TILE_CACHE = 'control-point-tiles-v1';
 
 const SHELL_ASSETS = [
@@ -14,15 +14,20 @@ const SHELL_ASSETS = [
   './js/feedback.js',
   './js/geo.js',
   './js/gpx.js',
+  './js/heading.js',
   './js/overpass.js',
   './js/points.js',
   './js/render.js',
   './js/run.js',
+  './js/supabase-client.js',
+  './js/auth-client.js',
+  './js/sync.js',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/icon-maskable-512.png',
   'https://unpkg.com/leaflet@1.9.4/dist/leaflet.css',
   'https://unpkg.com/leaflet@1.9.4/dist/leaflet.js',
+  'https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.113.0/dist/umd/supabase.js',
 ];
 
 self.addEventListener('install', (event) => {
@@ -50,7 +55,7 @@ function isTileRequest(url) {
 }
 
 function isLiveDataRequest(url) {
-  return /overpass-api\.de|overpass\.openstreetmap\.fr|overpass\.kumi\.systems|router\.project-osrm\.org/.test(url);
+  return /overpass-api\.de|overpass\.openstreetmap\.fr|overpass\.kumi\.systems|router\.project-osrm\.org|\.supabase\.co/.test(url);
 }
 
 self.addEventListener('fetch', (event) => {

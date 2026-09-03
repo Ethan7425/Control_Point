@@ -5,13 +5,57 @@ import { saveRun, getAllRuns, getRun, deleteRun } from './db.js';
 import { renderRunRecap, renderHistoryList, renderHistorySummary, fmtTime } from './render.js';
 import { unlockAudio, feedbackCollect, feedbackTimeUp } from './feedback.js';
 import { downloadGPX } from './gpx.js';
+import { isOrientationSupported, requestOrientationPermission, watchHeading } from './heading.js';
+import {
+  isAuthAvailable, getSession, onAuthStateChange, signUp, signIn, signOut, sendPasswordReset, updatePin,
+} from './auth-client.js';
+import { pushRun, deleteRemoteRun, pullAndMergeRuns, pushAllLocalRuns } from './sync.js';
 
 // ---------- version ----------
 // Bump this on every push — it's the quickest way to confirm a device is actually
 // running the latest deploy (shown small next to the app name in the header).
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 document.getElementById('app-version').textContent = `v${APP_VERSION}`;
 console.log(`Control Point v${APP_VERSION}`);
+
+// ---------- active-run persistence ----------
+// Mobile browsers (iOS Safari especially) routinely kill a backgrounded PWA's page
+// outright to reclaim memory — reopening it is a genuine fresh load with zero JS
+// state left. Without this, a run in progress just silently vanishes. Snapshotting
+// to localStorage on every meaningful change lets a fresh load offer to resume it.
+const ACTIVE_RUN_KEY = 'cp_active_run';
+
+function saveActiveRun() {
+  if (!runController || runController.ended) return;
+  try {
+    localStorage.setItem(ACTIVE_RUN_KEY, JSON.stringify({
+      startedAt: runController.startedAt,
+      settings: runController.settings,
+      points: runController.points,
+      route: runController.route,
+      distanceM: runController.distanceM,
+      elevationGainM: runController.elevationGainM,
+      elevationLossM: runController.elevationLossM,
+      loopGeometry: runController.loopGeometry,
+      rerollContext: currentRerollContext,
+    }));
+  } catch {
+    // storage full/unavailable — resume just won't be offered next time, not fatal
+  }
+}
+
+function loadActiveRun() {
+  try {
+    const saved = JSON.parse(localStorage.getItem(ACTIVE_RUN_KEY) || 'null');
+    return saved?.points?.length ? saved : null;
+  } catch {
+    return null;
+  }
+}
+
+function clearActiveRun() {
+  try { localStorage.removeItem(ACTIVE_RUN_KEY); } catch { /* nothing to clean up */ }
+}
 
 // ---------- service worker ----------
 // Beyond serving network-first, actively self-heal from a stale install: force an
@@ -333,8 +377,75 @@ async function beginRun() {
   startRunSession(center, settings, points, usedFallback && settings.style !== 'random', loopGeometry, rerollContext);
 }
 
+// Rebuilds a run that was interrupted by the OS killing the backgrounded page.
+// Gets a fresh GPS fix (time has passed, you may have moved) rather than trusting
+// a possibly-stale last-known point, then hands off to the normal run-session setup.
+async function resumeRun(saved) {
+  showView('loading');
+  setLoadingStatus('Resuming your run…', 'Getting your current location…');
+  const loadStart = Date.now();
+
+  let center, freshAltitude = null;
+  try {
+    const pos = await getCurrentPosition();
+    center = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+    freshAltitude = pos.coords.altitude;
+  } catch {
+    const last = saved.route[saved.route.length - 1];
+    center = { lat: last.lat, lon: last.lon };
+  }
+
+  const elapsed = Date.now() - loadStart;
+  if (elapsed < MIN_LOADING_MS) await new Promise((r) => setTimeout(r, MIN_LOADING_MS - elapsed));
+
+  startRunSession(center, saved.settings, saved.points, false, saved.loopGeometry, saved.rerollContext, {
+    route: saved.route,
+    distanceM: saved.distanceM,
+    elevationGainM: saved.elevationGainM,
+    elevationLossM: saved.elevationLossM,
+    startedAt: saved.startedAt,
+    freshAltitude,
+  });
+}
+
+// ---------- resume an interrupted run ----------
+const resumeRunModal = document.getElementById('resume-run-modal');
+const resumeRunMsg = document.getElementById('resume-run-msg');
+let pendingResume = null;
+
+function offerToResumeIfNeeded() {
+  // If the app is currently gated behind login (Supabase configured, no valid
+  // session — e.g. it expired while a run was active), don't let "resume" become
+  // a backdoor around the login screen; they'll see this prompt once signed in.
+  if (isAuthAvailable() && authMode !== 'signedIn') return;
+  const saved = loadActiveRun();
+  if (!saved) return;
+  pendingResume = saved;
+  const minsAgo = Math.max(0, Math.round((Date.now() - saved.startedAt) / 60000));
+  const collectedCount = saved.points.filter((p) => p.collected).length;
+  resumeRunMsg.textContent = `Started ${minsAgo} min ago · ${collectedCount}/${saved.points.length} points collected. Pick up where you left off?`;
+  resumeRunModal.classList.remove('hidden');
+}
+
+document.getElementById('resume-run-discard').addEventListener('click', () => {
+  clearActiveRun();
+  pendingResume = null;
+  resumeRunModal.classList.add('hidden');
+});
+document.getElementById('resume-run-confirm').addEventListener('click', () => {
+  resumeRunModal.classList.add('hidden');
+  if (!pendingResume) return;
+  const saved = pendingResume;
+  pendingResume = null;
+  resumeRun(saved);
+});
+
+// Resume-run check runs only after auth resolves (see initAuth() at the bottom of
+// this file) — otherwise a gated app could flash Settings, or offer to resume a
+// run, before the login screen has had a chance to take over.
+
 // ---------- run session ----------
-let map, userMarker, userAccuracyCircle, routeLine, loopRouteLine, pointMarkers = [], pointCircles = [];
+let map, userMarker, userRadar, userAccuracyCircle, routeLine, loopRouteLine, pointMarkers = [], pointCircles = [];
 let runController, geoWatcher, statsTimer, lastKnownLatLng = null, timeUpAnnounced = false;
 let currentCenter = null, currentRerollContext = null;
 
@@ -360,6 +471,17 @@ function userIcon() {
   });
 }
 
+// Purely decorative radar sweep centered on the user — reinforces the
+// "hunting for points" feel. Pointer-events disabled so it never blocks taps.
+function radarIcon() {
+  return L.divIcon({
+    className: '',
+    html: `<div class="cp-radar-sweep"></div>`,
+    iconSize: [150, 150],
+    iconAnchor: [75, 75],
+  });
+}
+
 // Visual reminder of exactly how close a point needs to be to collect it —
 // glows amber while uncollected, settles to a dim green ring once collected.
 function circleStyle(collected) {
@@ -368,20 +490,85 @@ function circleStyle(collected) {
     : { color: '#f59e0b', weight: 3, fillColor: '#f59e0b', fillOpacity: 0.16, opacity: 0.85 };
 }
 
-// Custom Leaflet control: large, thumb-friendly "recenter on me" button for mobile.
-const RecenterControl = L.Control.extend({
-  options: { position: 'bottomleft' },
-  onAdd() {
-    const btn = L.DomUtil.create('button', 'cp-recenter-btn');
-    btn.type = 'button';
-    btn.innerHTML = '⌖';
-    btn.setAttribute('aria-label', 'Center map on my location');
-    L.DomEvent.disableClickPropagation(btn);
-    L.DomEvent.on(btn, 'click', () => {
-      if (lastKnownLatLng) map.setView(lastKnownLatLng, Math.max(map.getZoom(), 16));
-    });
-    return btn;
-  },
+// Plain HTML buttons (not Leaflet controls) sitting OUTSIDE the map's rotating
+// element, so they stay upright and fixed in place regardless of compass rotation —
+// a Leaflet control would rotate along with everything else inside the map.
+document.getElementById('zoom-in-btn').addEventListener('click', () => map?.zoomIn());
+document.getElementById('zoom-out-btn').addEventListener('click', () => map?.zoomOut());
+document.getElementById('recenter-btn').addEventListener('click', () => {
+  if (map && lastKnownLatLng) map.setView(lastKnownLatLng, Math.max(map.getZoom(), 16));
+});
+
+// ---------- compass rotation (heading-up map) ----------
+// Leaflet has no native rotation support, and naively CSS-rotating its own root
+// container would rotate the zoom/recenter controls with it and desync touch-drag
+// math (Leaflet computes pan deltas assuming an unrotated container). Instead: #map
+// is oversized (to the viewport's diagonal, so rotating it never reveals empty
+// corners) and rotated on its own, while the controls live outside it entirely as
+// plain siblings — and dragging is disabled while active, matching how every
+// navigation app handles a heading-locked "follow me" view.
+let compassMode = false;
+let stopHeadingWatch = null;
+
+function sizeMapForRotation(rotating) {
+  const viewport = document.getElementById('map-viewport');
+  const mapEl = document.getElementById('map');
+  if (!rotating) {
+    mapEl.style.width = '';
+    mapEl.style.height = '';
+    mapEl.style.left = '';
+    mapEl.style.top = '';
+    mapEl.style.transform = '';
+  } else {
+    const vw = viewport.clientWidth, vh = viewport.clientHeight;
+    const diag = Math.ceil(Math.sqrt(vw * vw + vh * vh));
+    mapEl.style.width = `${diag}px`;
+    mapEl.style.height = `${diag}px`;
+    mapEl.style.left = `${(vw - diag) / 2}px`;
+    mapEl.style.top = `${(vh - diag) / 2}px`;
+  }
+  map?.invalidateSize();
+}
+
+function applyMapHeading(headingDeg) {
+  document.getElementById('map').style.transform = `rotate(${-headingDeg}deg)`;
+}
+
+async function enableCompassMode() {
+  if (!isOrientationSupported()) {
+    showToast('Compass rotation isn’t supported on this device');
+    return;
+  }
+  const granted = await requestOrientationPermission();
+  if (!granted) {
+    showToast('Compass permission was denied');
+    return;
+  }
+  compassMode = true;
+  document.getElementById('compass-toggle-btn').classList.add('active');
+  map.dragging.disable();
+  map.doubleClickZoom.disable();
+  sizeMapForRotation(true);
+  if (lastKnownLatLng) map.setView(lastKnownLatLng, Math.max(map.getZoom(), 17), { animate: false });
+  stopHeadingWatch = watchHeading(applyMapHeading);
+}
+
+function disableCompassMode() {
+  compassMode = false;
+  document.getElementById('compass-toggle-btn').classList.remove('active');
+  stopHeadingWatch?.();
+  stopHeadingWatch = null;
+  if (map) {
+    map.dragging.enable();
+    map.doubleClickZoom.enable();
+  }
+  sizeMapForRotation(false);
+}
+
+document.getElementById('compass-toggle-btn').addEventListener('click', () => {
+  if (!map) return;
+  if (compassMode) disableCompassMode();
+  else enableCompassMode();
 });
 
 // Tapping a point shows its name and, if it's still uncollected, a "Reroll this
@@ -418,14 +605,19 @@ function handleReroll(pointId) {
 
   showToast(`Point ${newPoint.index} re-rolled`);
   updateNextPointIndicator();
+  saveActiveRun();
 }
 
-function startRunSession(center, settings, points, usedFallback, loopGeometry, rerollContext) {
+function startRunSession(center, settings, points, usedFallback, loopGeometry, rerollContext, resumeState) {
   showView('run');
   document.getElementById('stat-score-wrap').classList.toggle('hidden', settings.mode !== 'scoreAttack');
   document.getElementById('stat-countdown-wrap').classList.toggle('hidden', settings.mode !== 'scoreAttack');
 
-  runController = new RunController(settings, points, center, loopGeometry);
+  // On a resume, the RunController shouldn't push a fresh single-point route (that
+  // would draw a straight line across however long the app was closed) — restore
+  // the saved route/distance/start time instead, then append where we are now.
+  runController = new RunController(settings, points, resumeState ? null : center, loopGeometry);
+  if (resumeState) runController.resumeFrom(resumeState, center.lat, center.lon, resumeState.freshAltitude);
   currentCenter = center;
   currentRerollContext = rerollContext;
   lastKnownLatLng = [center.lat, center.lon];
@@ -435,9 +627,15 @@ function startRunSession(center, settings, points, usedFallback, loopGeometry, r
   if (usedFallback) {
     setTimeout(() => showToast('OpenStreetMap data unavailable — points placed randomly instead'), 400);
   }
+  if (resumeState) {
+    setTimeout(() => showToast('Run resumed — picking up where you left off'), 400);
+  }
 
   if (map) { map.remove(); map = null; }
   userAccuracyCircle = null;
+  // Compass mode doesn't carry over between runs — start each one flat/north-up,
+  // and make sure #map has no leftover oversized/rotated inline styles from before.
+  disableCompassMode();
   map = L.map('map', {
     zoomControl: false,
     attributionControl: false,
@@ -446,9 +644,6 @@ function startRunSession(center, settings, points, usedFallback, loopGeometry, r
   }).setView([center.lat, center.lon], 17);
 
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
-  L.control.attribution({ position: 'bottomleft', prefix: false }).addAttribution('&copy; OpenStreetMap contributors').addTo(map);
-  L.control.zoom({ position: 'bottomright' }).addTo(map);
-  map.addControl(new RecenterControl());
 
   loopRouteLine = null;
   if (loopGeometry?.length) {
@@ -464,9 +659,15 @@ function startRunSession(center, settings, points, usedFallback, loopGeometry, r
     return marker;
   });
   pointCircles = points.map((p) =>
-    L.circle([p.lat, p.lon], { radius: COLLECT_RADIUS_M, className: 'cp-radius-glow', ...circleStyle(false) }).addTo(map)
+    L.circle([p.lat, p.lon], {
+      radius: COLLECT_RADIUS_M,
+      className: p.collected ? '' : 'cp-radius-glow',
+      ...circleStyle(p.collected),
+    }).addTo(map)
   );
-  routeLine = L.polyline([[center.lat, center.lon]], { color: '#3b82f6', weight: 4, opacity: 0.85 }).addTo(map);
+  const initialRoute = resumeState ? runController.route.map((r) => [r.lat, r.lon]) : [[center.lat, center.lon]];
+  routeLine = L.polyline(initialRoute, { color: '#3b82f6', weight: 4, opacity: 0.85 }).addTo(map);
+  userRadar = L.marker([center.lat, center.lon], { icon: radarIcon(), interactive: false, zIndexOffset: 900 }).addTo(map);
   userMarker = L.marker([center.lat, center.lon], { icon: userIcon(), zIndexOffset: 1000 }).addTo(map);
 
   geoWatcher = new GeoWatcher(onPositionUpdate, onPositionError);
@@ -474,6 +675,7 @@ function startRunSession(center, settings, points, usedFallback, loopGeometry, r
 
   statsTimer = setInterval(updateStatBar, 1000);
   updateStatBar();
+  saveActiveRun();
 }
 
 function showToast(text) {
@@ -485,12 +687,14 @@ function showToast(text) {
 }
 
 function onPositionUpdate(pos) {
-  const { latitude: lat, longitude: lon, accuracy } = pos.coords;
-  const collected = runController.tick(lat, lon);
+  const { latitude: lat, longitude: lon, accuracy, altitude } = pos.coords;
+  const collected = runController.tick(lat, lon, altitude);
 
   lastKnownLatLng = [lat, lon];
   userMarker.setLatLng([lat, lon]);
+  userRadar.setLatLng([lat, lon]);
   routeLine.addLatLng([lat, lon]);
+  if (compassMode) map.setView([lat, lon], map.getZoom(), { animate: false });
 
   if (userAccuracyCircle) {
     userAccuracyCircle.setLatLng([lat, lon]).setRadius(accuracy || 0);
@@ -512,6 +716,7 @@ function onPositionUpdate(pos) {
   }
 
   updateStatBar();
+  saveActiveRun();
 }
 
 function onPositionError(err) {
@@ -573,7 +778,8 @@ async function shareRun(run) {
   const text =
     `Control Point — ${MODE_LABEL_FOR_SHARE[run.mode] || run.mode}\n` +
     `${(run.distanceM / 1000).toFixed(2)} km in ${fmtTime(run.totalMs)} · ${run.pointsCollected}/${run.pointsTotal} points` +
-    (run.mode === 'scoreAttack' ? ` · score ${run.score}` : '');
+    (run.mode === 'scoreAttack' ? ` · score ${run.score}` : '') +
+    (run.elevationGainM > 0 ? ` · ↗ ${run.elevationGainM} m` : '');
   try {
     if (navigator.share) {
       await navigator.share({ title: 'Control Point run', text });
@@ -607,6 +813,7 @@ async function endRun() {
   clearInterval(statsTimer);
   releaseWakeLock();
   runController.end();
+  clearActiveRun();
   const summary = runController.summary();
   const run = { id: `run_${summary.startedAt}`, ...summary };
 
@@ -615,6 +822,7 @@ async function endRun() {
   } catch (e) {
     console.warn('Failed to save run to history:', e);
   }
+  if (currentUser) pushRun(run, currentUser.id); // fire-and-forget, local save already succeeded
 
   showView('recap');
   const container = document.getElementById('recap-content');
@@ -647,6 +855,7 @@ document.getElementById('delete-run-confirm').addEventListener('click', async ()
   deleteRunModal.classList.add('hidden');
   if (!pendingDeleteId) return;
   await deleteRun(pendingDeleteId);
+  if (currentUser) deleteRemoteRun(pendingDeleteId, currentUser.id); // fire-and-forget, local delete already done
   pendingDeleteId = null;
   loadHistory();
 });
@@ -684,3 +893,229 @@ async function loadHistory() {
     }
   );
 }
+
+// ---------- account / cross-device sync (optional — no-op unless Supabase is configured) ----------
+let currentUser = null;
+let authMode = 'signedOut'; // 'signedOut' | 'recovery' | 'signedIn'
+
+function showAccountError(msg) {
+  const el = document.getElementById('account-error');
+  if (!el) return;
+  el.textContent = msg;
+  el.classList.remove('hidden');
+}
+
+function readAccountFields() {
+  return {
+    email: document.getElementById('account-email')?.value.trim() || '',
+    pin: document.getElementById('account-pin')?.value.trim() || '',
+  };
+}
+
+// The whole app is gated behind sign-in, but ONLY when Supabase is actually
+// configured — a fork/clone of this project with no Supabase project set up
+// still works exactly as a local-only app, no dead-end login wall.
+function applyAuthGate(gated) {
+  const topnav = document.querySelector('.topnav');
+  if (gated) {
+    topnav.classList.add('hidden');
+    showView('onboarding');
+  } else {
+    topnav.classList.remove('hidden');
+    if (document.getElementById('view-onboarding').classList.contains('active')) {
+      showView('settings');
+    }
+  }
+}
+
+function renderSignedInBox(container) {
+  const initial = escapeHtml((currentUser.email || '?').charAt(0).toUpperCase());
+  container.innerHTML = `
+    <div class="account-box">
+      <div class="account-signedin">
+        <div class="who">
+          <div class="avatar">${initial}</div>
+          <div>
+            <h4>Synced</h4>
+            <div class="email">${escapeHtml(currentUser.email)}</div>
+          </div>
+        </div>
+        <button id="account-signout-btn" class="secondary-btn">Sign Out</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('account-signout-btn').addEventListener('click', handleSignOut);
+}
+
+function renderRecoveryForm(container) {
+  container.innerHTML = `
+    <div class="account-box">
+      <h4>Set a new PIN</h4>
+      <p class="hint">You followed a reset link — enter a new 6-digit PIN for your account.</p>
+      <div class="account-field">
+        <label for="account-new-pin">New PIN</label>
+        <input type="password" id="account-new-pin" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="new-password">
+      </div>
+      <button id="account-set-pin-btn" class="primary-btn">Set PIN</button>
+      <div class="account-error hidden" id="account-error"></div>
+    </div>
+  `;
+  document.getElementById('account-set-pin-btn').addEventListener('click', handleSetNewPin);
+}
+
+function renderSignInForm(container) {
+  container.innerHTML = `
+    <div class="account-box">
+      <div class="account-field">
+        <label for="account-email">Email</label>
+        <input type="email" id="account-email" autocomplete="email" placeholder="you@example.com">
+      </div>
+      <div class="account-field">
+        <label for="account-pin">6-digit PIN</label>
+        <input type="password" id="account-pin" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="current-password" placeholder="••••••">
+      </div>
+      <div class="account-row">
+        <button id="account-signin-btn" class="primary-btn">Sign In</button>
+        <button id="account-signup-btn" class="secondary-btn">Create Account</button>
+      </div>
+      <button id="account-forgot-btn" class="account-link" type="button">Forgot PIN?</button>
+      <div class="account-error hidden" id="account-error"></div>
+    </div>
+  `;
+  document.getElementById('account-signin-btn').addEventListener('click', handleSignIn);
+  document.getElementById('account-signup-btn').addEventListener('click', handleSignUp);
+  document.getElementById('account-forgot-btn').addEventListener('click', handleForgotPin);
+}
+
+function renderAccountSection() {
+  if (!isAuthAvailable()) {
+    document.getElementById('account-settings-section').classList.add('hidden');
+    return;
+  }
+  document.getElementById('account-settings-section').classList.remove('hidden');
+
+  if (authMode === 'signedIn' && currentUser) {
+    renderSignedInBox(document.getElementById('account-section'));
+    applyAuthGate(false);
+    return;
+  }
+
+  // Not signed in (or mid password-reset) — the app is gated behind the
+  // onboarding/login screen, so that's where the form belongs, not Settings.
+  const target = document.getElementById('onboarding-account');
+  if (authMode === 'recovery') {
+    renderRecoveryForm(target);
+  } else {
+    renderSignInForm(target);
+  }
+  applyAuthGate(true);
+}
+
+async function onSignedIn(user) {
+  currentUser = user;
+  authMode = 'signedIn';
+  renderAccountSection();
+  offerToResumeIfNeeded(); // in case a run was interrupted while the session had expired
+  showToast('Syncing your run history…');
+  const { pulled, error } = await pullAndMergeRuns(user.id);
+  if (error) {
+    showToast('Sync failed — your local history is safe, will retry next time');
+    return;
+  }
+  loadHistory();
+  showToast(pulled ? `Synced ${pulled} run${pulled === 1 ? '' : 's'} from your account` : 'Synced — up to date');
+}
+
+async function handleSignIn() {
+  const { email, pin } = readAccountFields();
+  if (!email || !/^\d{6}$/.test(pin)) {
+    showAccountError('Enter your email and 6-digit PIN.');
+    return;
+  }
+  const { user, error } = await signIn(email, pin);
+  if (error) {
+    showAccountError(error.message);
+    return;
+  }
+  await onSignedIn(user);
+}
+
+async function handleSignUp() {
+  const { email, pin } = readAccountFields();
+  if (!email || !/^\d{6}$/.test(pin)) {
+    showAccountError('Enter your email and a 6-digit PIN.');
+    return;
+  }
+  const { user, session, error } = await signUp(email, pin);
+  if (error) {
+    showAccountError(error.message);
+    return;
+  }
+  if (!session) {
+    // A user record was created, but Supabase's "Confirm email" setting is on —
+    // no session exists until they click the link, so there's nothing to sync yet.
+    showToast('Check your email to confirm your account, then sign in');
+    return;
+  }
+  await onSignedIn(user);
+  await pushAllLocalRuns(user.id); // carry over history recorded before this account existed
+  loadHistory();
+}
+
+async function handleForgotPin() {
+  const { email } = readAccountFields();
+  if (!email) {
+    showAccountError('Enter your email above first, then tap "Forgot PIN?".');
+    return;
+  }
+  const { error } = await sendPasswordReset(email);
+  if (error) {
+    showAccountError(error.message);
+    return;
+  }
+  showToast('Check your email for a reset link');
+}
+
+async function handleSetNewPin() {
+  const pin = document.getElementById('account-new-pin')?.value.trim() || '';
+  if (!/^\d{6}$/.test(pin)) {
+    showAccountError('Enter a 6-digit PIN.');
+    return;
+  }
+  const { error } = await updatePin(pin);
+  if (error) {
+    showAccountError(error.message);
+    return;
+  }
+  showToast('PIN updated');
+  const session = await getSession();
+  if (session?.user) await onSignedIn(session.user);
+}
+
+async function handleSignOut() {
+  await signOut();
+  currentUser = null;
+  authMode = 'signedOut';
+  renderAccountSection();
+}
+
+async function initAuth() {
+  if (!isAuthAvailable()) return;
+  onAuthStateChange((event) => {
+    if (event === 'PASSWORD_RECOVERY') {
+      authMode = 'recovery';
+      renderAccountSection();
+    } else if (event === 'SIGNED_OUT') {
+      currentUser = null;
+      authMode = 'signedOut';
+      renderAccountSection();
+    }
+  });
+  const session = await getSession();
+  if (session?.user) {
+    currentUser = session.user;
+    authMode = 'signedIn';
+  }
+  renderAccountSection();
+}
+initAuth().then(offerToResumeIfNeeded);

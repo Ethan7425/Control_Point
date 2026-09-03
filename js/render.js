@@ -32,7 +32,12 @@ function heroFor(run) {
 
 export function renderRunRecap(container, run, mapDivId) {
   const hero = heroFor(run);
-  const pace = run.paceMinPerKm ? `${run.paceMinPerKm.toFixed(1)} /km` : '—';
+  // Derived at display time rather than trusting a stored field — keeps this correct
+  // even for a run pulled down from another device, where a duplicated derived value
+  // like this could otherwise go missing/stale independently of distance and time.
+  const distanceKm = run.distanceM / 1000;
+  const paceMinPerKm = distanceKm > 0 ? run.totalMs / 60000 / distanceKm : null;
+  const pace = paceMinPerKm ? `${paceMinPerKm.toFixed(1)} /km` : '—';
 
   container.innerHTML = `
     <div class="recap-hero">
@@ -48,6 +53,8 @@ export function renderRunRecap(container, run, mapDivId) {
       <div class="recap-card"><div class="v">${run.pointsCollected}/${run.pointsTotal}</div><div class="l">Points</div></div>
       <div class="recap-card"><div class="v">${run.score}</div><div class="l">Score</div></div>
       <div class="recap-card"><div class="v">${MODE_LABEL[run.mode] || run.mode}</div><div class="l">Mode</div></div>
+      ${typeof run.elevationGainM === 'number' ? `<div class="recap-card"><div class="v">↗ ${run.elevationGainM} m</div><div class="l">Elev gain</div></div>` : ''}
+      ${typeof run.elevationLossM === 'number' ? `<div class="recap-card"><div class="v">↘ ${run.elevationLossM} m</div><div class="l">Elev loss</div></div>` : ''}
     </div>
     <ul class="points-list">
       ${run.points.map((p) => `
@@ -143,18 +150,27 @@ export function renderHistorySummary(container, runs) {
 
 export function renderHistoryList(container, runs, onSelect, onDelete) {
   if (!runs.length) {
-    container.innerHTML = `<div class="empty-state">No runs yet. Finish a run and it'll show up here.</div>`;
+    container.innerHTML = `
+      <div class="empty-state">
+        <div class="icon">◎</div>
+        <div class="title">No runs yet</div>
+        <div class="sub">Finish a run and it'll show up here.</div>
+      </div>
+    `;
     return;
   }
   container.innerHTML = runs.map((r) => `
     <div class="history-item" data-id="${r.id}">
-      <div class="hi-main">
-        <span class="hi-mode">${MODE_LABEL[r.mode] || r.mode}</span>
-        <span class="hi-date">${fmtDate(r.startedAt)}</span>
-      </div>
-      <div class="hi-stats">
-        ${(r.distanceM / 1000).toFixed(2)} km &middot; ${fmtTime(r.totalMs)}<br>
-        ${r.pointsCollected}/${r.pointsTotal} pts
+      <span class="hi-mode-dot"></span>
+      <div class="hi-body">
+        <div class="hi-main">
+          <span class="hi-mode">${MODE_LABEL[r.mode] || r.mode}</span>
+          <span class="hi-date">${fmtDate(r.startedAt)}</span>
+        </div>
+        <div class="hi-stats">
+          ${(r.distanceM / 1000).toFixed(2)} km &middot; ${fmtTime(r.totalMs)}<br>
+          ${r.pointsCollected}/${r.pointsTotal} pts
+        </div>
       </div>
       <button class="hi-delete" data-id="${r.id}" aria-label="Delete run">&#128465;</button>
     </div>

@@ -7,7 +7,10 @@ function esc(s) {
 
 export function buildGPX(run) {
   const trkpts = run.route
-    .map((r) => `      <trkpt lat="${r.lat}" lon="${r.lon}"><time>${new Date(r.t).toISOString()}</time></trkpt>`)
+    .map((r) => {
+      const ele = typeof r.alt === 'number' ? `<ele>${r.alt.toFixed(1)}</ele>` : '';
+      return `      <trkpt lat="${r.lat}" lon="${r.lon}">${ele}<time>${new Date(r.t).toISOString()}</time></trkpt>`;
+    })
     .join('\n');
 
   const wpts = run.points
