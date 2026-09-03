@@ -403,6 +403,65 @@ input[type="range"]::-moz-range-thumb {
 #recenter-btn { color: var(--accent); font-size: 24px; }
 #compass-toggle-btn.active { background: var(--accent); color: #06170f; border-color: var(--accent); }
 
+.area-map-wrap {
+  position: relative;
+  height: 240px;
+  margin-top: 10px;
+  border-radius: var(--radius-md);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+}
+#area-map { width: 100%; height: 100%; background: var(--bg-elev-2); }
+.area-map-placeholder {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 24px;
+  text-align: center;
+  color: var(--text-faint);
+  font-size: 13px;
+  line-height: 1.4;
+  pointer-events: none;
+}
+.area-map-btn.area-map-btn {
+  position: absolute;
+  top: 10px;
+  right: 10px;
+  width: 38px;
+  height: 38px;
+  font-size: 19px;
+  color: var(--accent);
+  z-index: 500;
+}
+.area-center-pin {
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: var(--accent);
+  border: 3px solid #06170f;
+  box-shadow: 0 0 0 5px rgba(51, 196, 141, 0.25);
+}
+.area-edge-handle {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: #fff;
+  border: 3px solid var(--accent);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.4);
+}
+.area-me-dot {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: #4d9eff;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 4px rgba(77, 158, 255, 0.28);
+}
+
 .stat-bar {
   position: absolute;
   top: 10px;

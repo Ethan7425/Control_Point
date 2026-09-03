@@ -132,6 +132,16 @@
           </div>
 
           <div class="field-group">
+            <label>Search area</label>
+            <div class="area-map-wrap" id="area-map-wrap">
+              <div id="area-map"></div>
+              <p class="area-map-placeholder" id="area-map-placeholder">Getting your location…</p>
+              <button type="button" id="area-recenter-btn" class="map-ctrl-btn area-map-btn" aria-label="Center search area on my location">⌖</button>
+            </div>
+            <p class="hint">Drag the center pin to move the search area away from you, drag the ring handle to resize it. Leave it alone to search around your actual location.</p>
+          </div>
+
+          <div class="field-group">
             <label for="numPoints">Number of points <span class="unit" id="numPoints-val">6</span></label>
             <input type="range" id="numPoints" min="2" max="30" step="1" value="6">
           </div>

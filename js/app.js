@@ -1,4 +1,4 @@
-import { getCurrentPosition, GeoWatcher, bearing, compassDirection, haversine } from './geo.js';
+import { getCurrentPosition, GeoWatcher, bearing, compassDirection, haversine, destinationPoint } from './geo.js';
 import { generatePoints, rerollPoint } from './points.js';
 import { RunController, COLLECT_RADIUS_M } from './run.js';
 import { saveRun, getAllRuns, getRun, deleteRun } from './db.js';
@@ -15,7 +15,7 @@ import { pushRun, deleteRemoteRun, pullAndMergeRuns, pushAllLocalRuns } from './
 // ---------- version ----------
 // Bump this on every push — it's the quickest way to confirm a device is actually
 // running the latest deploy (shown small next to the app name in the header).
-const APP_VERSION = '1.1.2';
+const APP_VERSION = '1.2.0';
 document.getElementById('app-version').textContent = `v${APP_VERSION}`;
 console.log(`Control Point v${APP_VERSION}`);
 
@@ -161,6 +161,12 @@ function showView(name) {
   // loading/run/recap are all part of the "Run" flow — keep that tab highlighted through them.
   const navName = name === 'history' ? 'history' : 'settings';
   navBtns.forEach((b) => b.classList.toggle('active', b.dataset.view === navName));
+  if (name === 'settings') {
+    if (!areaMapInited) initAreaMap();
+    // The map container is display:none while this view is inactive — Leaflet
+    // computes tile layout from container size, so it needs a nudge once visible again.
+    else setTimeout(() => areaMap?.invalidateSize(), 30);
+  }
 }
 
 navBtns.forEach((btn) => {
@@ -173,6 +179,13 @@ navBtns.forEach((btn) => {
 // ---------- settings form ----------
 const form = document.getElementById('settings-form');
 const fields = { mode: 'explore', layout: 'scatter', style: 'path' };
+
+// Search-area map state, declared early since onFieldChange('layout') below (called
+// at setup time, before the map itself is ever built) touches it via updateAreaMapRadius().
+let areaMap = null, areaMapInited = false;
+let areaCircle = null, areaCenterMarker = null, areaEdgeMarker = null, areaMeMarker = null;
+let areaTrueLoc = null; // last known real GPS fix, for the "me" reference dot
+let areaOverrideCenter = null; // {lat, lon} once the user drags the pin away from "me"; null = follow me
 
 document.querySelectorAll('.segmented').forEach((group) => {
   const key = group.dataset.field;
@@ -201,6 +214,7 @@ function onFieldChange(key) {
   if (key === 'layout') {
     rowRadius.classList.toggle('hidden', fields.layout !== 'scatter');
     rowDistance.classList.toggle('hidden', fields.layout !== 'loop');
+    updateAreaMapRadius();
   }
   if (key === 'mode') {
     rowTimeBudget.classList.toggle('hidden', fields.mode !== 'scoreAttack');
@@ -225,6 +239,146 @@ sliderIds.forEach((id) => {
   };
   el.addEventListener('input', update);
   update();
+});
+
+// ---------- search-area map (move/resize the point-generation area before starting) ----------
+// Point 1 in Loop mode is always your literal GPS position (you're standing there when
+// the run starts) — this only steers *where the other points get scattered/planned
+// around*, so you can nudge the whole search disc away from a road you don't want to
+// cross, a sketchy block, etc. Leaving the pin alone (never dragged) keeps the exact
+// previous behavior: search area centered on wherever you happen to be when you start.
+function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
+
+function currentPreviewRadiusM() {
+  if (fields.layout === 'loop') {
+    const distanceKm = parseFloat(document.getElementById('distance').value);
+    return (distanceKm * 1000) / (2 * Math.PI);
+  }
+  return parseFloat(document.getElementById('radius').value) * 1000;
+}
+
+function edgePosFor(center, radiusM) {
+  return destinationPoint(center.lat, center.lon, 90, radiusM);
+}
+
+// Writes a dragged ring-handle radius back into the relevant slider (so the numeric
+// value and label stay truthful), rounded to that slider's own step.
+function applyPreviewRadiusToSlider(radiusM) {
+  if (fields.layout === 'loop') {
+    const el = document.getElementById('distance');
+    const km = clamp((radiusM * 2 * Math.PI) / 1000, parseFloat(el.min), parseFloat(el.max));
+    el.value = (Math.round(km / 0.5) * 0.5).toFixed(1);
+  } else {
+    const el = document.getElementById('radius');
+    const km = clamp(radiusM / 1000, parseFloat(el.min), parseFloat(el.max));
+    el.value = (Math.round(km / 0.1) * 0.1).toFixed(1);
+  }
+  document.getElementById(fields.layout === 'loop' ? 'distance' : 'radius').dispatchEvent(new Event('input'));
+}
+
+// Keeps the whole circle (plus its edge handle) AND your real position in view —
+// radii range from 300m to 15km across the settings, so a fixed zoom would routinely
+// push the resize handle off-screen, and if we only fit the circle, dragging the
+// search area far from yourself would push the "me" dot off-screen too, defeating
+// the entire point of showing both together.
+function fitAreaMapToCircle() {
+  if (!areaMap || !areaCircle) return;
+  const bounds = areaCircle.getBounds();
+  if (areaTrueLoc) bounds.extend([areaTrueLoc.lat, areaTrueLoc.lon]);
+  areaMap.fitBounds(bounds, { padding: [28, 28] });
+}
+
+// Slider moved by hand — keep the circle/handle on the map in sync with it.
+function updateAreaMapRadius() {
+  if (!areaMap) return;
+  const c = areaCenterMarker.getLatLng();
+  const r = currentPreviewRadiusM();
+  areaCircle.setRadius(r);
+  const edge = edgePosFor({ lat: c.lat, lon: c.lng }, r);
+  areaEdgeMarker.setLatLng([edge.lat, edge.lon]);
+  fitAreaMapToCircle();
+}
+['radius', 'distance'].forEach((id) => document.getElementById(id).addEventListener('input', updateAreaMapRadius));
+
+async function initAreaMap() {
+  if (areaMapInited) return;
+  const placeholder = document.getElementById('area-map-placeholder');
+  try {
+    const pos = await getCurrentPosition({ maximumAge: 60000, timeout: 10000 });
+    areaTrueLoc = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+  } catch {
+    placeholder.textContent = 'Location unavailable — the search area will default to your position when you start.';
+    return; // leave areaMapInited false so we retry next time settings is opened
+  }
+  areaMapInited = true;
+  placeholder.classList.add('hidden');
+
+  areaMap = L.map('area-map', { zoomControl: false, attributionControl: false })
+    .setView([areaTrueLoc.lat, areaTrueLoc.lon], 15); // fitAreaMapToCircle() below replaces this once the circle exists
+  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(areaMap);
+
+  areaMeMarker = L.marker([areaTrueLoc.lat, areaTrueLoc.lon], {
+    icon: L.divIcon({ className: '', html: '<div class="area-me-dot"></div>', iconSize: [12, 12] }),
+    interactive: false, zIndexOffset: 800,
+  }).addTo(areaMap);
+
+  const center = areaOverrideCenter || areaTrueLoc;
+  const radiusM = currentPreviewRadiusM();
+
+  areaCircle = L.circle([center.lat, center.lon], {
+    radius: radiusM, color: '#33c48d', weight: 2, fillColor: '#33c48d', fillOpacity: 0.12,
+  }).addTo(areaMap);
+
+  areaCenterMarker = L.marker([center.lat, center.lon], {
+    icon: L.divIcon({ className: '', html: '<div class="area-center-pin"></div>', iconSize: [18, 18] }),
+    draggable: true, zIndexOffset: 900,
+  }).addTo(areaMap);
+
+  const edge = edgePosFor(center, radiusM);
+  areaEdgeMarker = L.marker([edge.lat, edge.lon], {
+    icon: L.divIcon({ className: '', html: '<div class="area-edge-handle"></div>', iconSize: [16, 16] }),
+    draggable: true, zIndexOffset: 900,
+  }).addTo(areaMap);
+
+  areaCenterMarker.on('drag', () => {
+    const c = areaCenterMarker.getLatLng();
+    areaCircle.setLatLng(c);
+    const e = edgePosFor({ lat: c.lat, lon: c.lng }, areaCircle.getRadius());
+    areaEdgeMarker.setLatLng([e.lat, e.lon]);
+  });
+  areaCenterMarker.on('dragend', () => {
+    const c = areaCenterMarker.getLatLng();
+    areaOverrideCenter = { lat: c.lat, lon: c.lng };
+    fitAreaMapToCircle();
+  });
+
+  areaEdgeMarker.on('drag', () => {
+    const c = areaCenterMarker.getLatLng();
+    const e = areaEdgeMarker.getLatLng();
+    areaCircle.setRadius(haversine(c.lat, c.lng, e.lat, e.lng));
+  });
+  areaEdgeMarker.on('dragend', () => {
+    // Dispatches 'input' on the slider, which re-triggers updateAreaMapRadius() (snapping
+    // the handle exactly onto the circle at the clamped/rounded radius) and re-fits the view.
+    applyPreviewRadiusToSlider(areaCircle.getRadius());
+  });
+
+  fitAreaMapToCircle();
+}
+
+document.getElementById('area-recenter-btn').addEventListener('click', async () => {
+  try {
+    const pos = await getCurrentPosition({ maximumAge: 0, timeout: 10000 });
+    areaTrueLoc = { lat: pos.coords.latitude, lon: pos.coords.longitude };
+  } catch {
+    // no fresh fix — fall back to the last known "me" position
+  }
+  areaOverrideCenter = null;
+  if (!areaMap || !areaTrueLoc) return;
+  areaMeMarker.setLatLng([areaTrueLoc.lat, areaTrueLoc.lon]);
+  areaCenterMarker.setLatLng([areaTrueLoc.lat, areaTrueLoc.lon]);
+  areaCircle.setLatLng([areaTrueLoc.lat, areaTrueLoc.lon]);
+  updateAreaMapRadius(); // also re-fits the view to the circle
 });
 
 // ---------- settings persistence (remembers your last-used setup across visits) ----------
@@ -347,7 +501,7 @@ async function beginRun() {
   let points, usedFallback, loopGeometry, rerollContext, lastErr;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      ({ points, usedFallback, loopGeometry, rerollContext } = await generatePoints(center, settings));
+      ({ points, usedFallback, loopGeometry, rerollContext } = await generatePoints(center, settings, areaOverrideCenter || center));
       lastErr = null;
       break;
     } catch (err) {
@@ -1285,4 +1439,12 @@ async function initAuth() {
 initAuth().then(() => {
   document.getElementById('app-boot')?.classList.add('hidden');
   offerToResumeIfNeeded();
+  // Settings is the default active view in the markup itself, so if we're landing
+  // there straight from boot (signed in already, or no auth configured at all — the
+  // local-only fallback), showView('settings') never actually runs and the area map
+  // would otherwise never get initialized. Gated (onboarding) boots skip this; the
+  // showView() hook picks the map up once the user actually reaches settings.
+  if (document.getElementById('view-settings').classList.contains('active') && !areaMapInited) {
+    initAreaMap();
+  }
 });

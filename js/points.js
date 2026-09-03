@@ -127,17 +127,22 @@ function toPoint(candidate, index, center) {
   };
 }
 
-export async function generatePoints(center, settings) {
+// `areaCenter` (defaults to `center`) is where the point *search disc* is anchored —
+// it can be dragged away from `center` (your actual GPS start) on the settings map so
+// you can steer the whole generated area away from somewhere you don't want to go.
+// `center` itself always stays your true start position (used for distFromStart/weight
+// and, in Loop mode, as point 1 — see generateSequentialLoop).
+export async function generatePoints(center, settings, areaCenter = center) {
   const { layout, radiusKm, distanceKm, numPoints, minSpacing, maxSpacing, style } = settings;
 
-  if (layout === 'loop') return generateSequentialLoop(center, settings);
+  if (layout === 'loop') return generateSequentialLoop(center, settings, areaCenter);
 
   const effectiveRadiusM = radiusKm * 1000;
-  const { source, pool, usedFallback } = await buildSource(center, effectiveRadiusM, style);
+  const { source, pool, usedFallback } = await buildSource(areaCenter, effectiveRadiusM, style);
   const picked = selectSpaced(source, numPoints, minSpacing, maxSpacing);
   const points = picked.map((p, i) => toPoint(p, i + 1, center));
 
-  return { points, usedFallback, loopGeometry: null, rerollContext: { pool, effectiveRadiusM } };
+  return { points, usedFallback, loopGeometry: null, rerollContext: { pool, effectiveRadiusM, areaCenter } };
 }
 
 // A structured course, not a free scatter: point 1 is where you start (collected
@@ -145,12 +150,12 @@ export async function generatePoints(center, settings) {
 // distance from start (so it isn't trivially the same spot as point 1), and the
 // points in between are visited strictly in order. Collection order is enforced
 // by RunController, not here — this just decides *what* that order is.
-async function generateSequentialLoop(center, settings) {
+async function generateSequentialLoop(center, settings, areaCenter = center) {
   const { distanceKm, numPoints, minSpacing, maxSpacing, style } = settings;
   const effectiveRadiusM = (distanceKm * 1000) / (2 * Math.PI) * (0.85 + Math.random() * 0.3); // organic, not a perfect circle
   const middleCount = Math.max(0, numPoints - 2);
 
-  const { source, pool, usedFallback } = await buildSource(center, effectiveRadiusM, style);
+  const { source, pool, usedFallback } = await buildSource(areaCenter, effectiveRadiusM, style);
   const middleCandidates = selectSpaced(source, middleCount, minSpacing, maxSpacing);
   const finishCandidate = randomInDisk(center, FINISH_MAX_DIST, FINISH_MIN_DIST);
 
@@ -174,7 +179,7 @@ async function generateSequentialLoop(center, settings) {
     usedFallback,
     loopGeometry,
     rerollContext: {
-      pool, effectiveRadiusM,
+      pool, effectiveRadiusM, areaCenter,
       sequential: true,
       finishAnchor: center,
       finishMinDist: FINISH_MIN_DIST,
@@ -188,7 +193,7 @@ async function generateSequentialLoop(center, settings) {
 // generation pass when available (no extra network round-trip); falls back to a
 // synthetic random point otherwise — always succeeds, never blocks on a network call.
 export function rerollPoint(target, allPoints, center, settings, rerollContext) {
-  const { pool, effectiveRadiusM, sequential, finishAnchor, finishMinDist, finishMaxDist } = rerollContext;
+  const { pool, effectiveRadiusM, sequential, finishAnchor, finishMinDist, finishMaxDist, areaCenter } = rerollContext;
   const others = allPoints.filter((p) => p.id !== target.id);
   const usedKeys = new Set(others.map((p) => `${p.lat.toFixed(6)},${p.lon.toFixed(6)}`));
   const respectsSpacing = (cand) => others.every((p) => haversine(p.lat, p.lon, cand.lat, cand.lon) >= settings.minSpacing);
@@ -203,7 +208,7 @@ export function rerollPoint(target, allPoints, center, settings, rerollContext) 
     chosen = available.find(respectsSpacing) || available[0] || null;
   }
   if (!chosen) {
-    const anchor = isFinishPoint ? finishAnchor : center;
+    const anchor = isFinishPoint ? finishAnchor : (areaCenter || center);
     const maxDist = isFinishPoint ? finishMaxDist : effectiveRadiusM;
     const minDist = isFinishPoint ? finishMinDist : undefined;
     for (let i = 0; i < 40; i++) {
