@@ -19,6 +19,14 @@
 </head>
 <body>
 
+<!-- Shown instantly on cold start (plain HTML/CSS, no JS dependency) so
+     reopening the app never shows a stark blank/black screen while auth and
+     view state resolve. Hidden by app.js once that's done. -->
+<div id="app-boot" class="app-boot">
+  <div class="spinner" aria-hidden="true"></div>
+  <div class="app-boot-brand">◎ Control Point</div>
+</div>
+
 <header class="topbar">
   <div class="brand">
     <span class="brand-mark">◎</span>
@@ -96,7 +104,7 @@
         <h3 class="settings-section-title">Game setup</h3>
         <form id="settings-form">
           <div class="field-group">
-            <label>Game mode</label>
+            <label>Game mode <button type="button" class="info-btn" id="mode-info-btn" aria-label="What do the game modes mean?">?</button></label>
             <div class="segmented" data-field="mode">
               <button type="button" class="seg active" data-value="explore">Free Explore</button>
               <button type="button" class="seg" data-value="timeTrial">Time Trial</button>
@@ -125,7 +133,7 @@
 
           <div class="field-group">
             <label for="numPoints">Number of points <span class="unit" id="numPoints-val">6</span></label>
-            <input type="range" id="numPoints" min="2" max="20" step="1" value="6">
+            <input type="range" id="numPoints" min="2" max="30" step="1" value="6">
           </div>
 
           <div class="two-col">
@@ -144,7 +152,7 @@
             <div class="segmented" data-field="style">
               <button type="button" class="seg" data-value="random">Pure random</button>
               <button type="button" class="seg active" data-value="path">Snapped to path</button>
-              <button type="button" class="seg" data-value="poi">POI-flavored</button>
+              <button type="button" class="seg" data-value="poi" disabled title="Not ready yet">POI-flavored (WIP)</button>
             </div>
             <p class="hint">Path/POI styles query OpenStreetMap so points land somewhere you can actually walk.</p>
           </div>
@@ -212,6 +220,47 @@
     </div>
   </section>
 
+  <!-- ACCOUNT VIEW — reached only from the Settings account row, only when signed in -->
+  <section id="view-account" class="view">
+    <div class="page-container">
+      <button class="back-btn" id="account-page-back">&larr; Back to settings</button>
+
+      <div class="account-page-header">
+        <div class="avatar avatar-lg" id="account-page-avatar"></div>
+        <div>
+          <h2 id="account-page-name">Your account</h2>
+          <p class="hint" id="account-page-email"></p>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">Profile</h3>
+        <div class="account-box">
+          <div class="account-field">
+            <label for="account-display-name">Display name</label>
+            <input type="text" id="account-display-name" maxlength="40" placeholder="Add a name">
+          </div>
+          <button id="account-save-name-btn" class="primary-btn">Save</button>
+          <div class="account-error hidden" id="account-name-error"></div>
+        </div>
+      </div>
+
+      <div class="settings-section">
+        <h3 class="settings-section-title">Security</h3>
+        <div class="account-box">
+          <div class="account-field">
+            <label for="account-change-pin">New 6-digit PIN</label>
+            <input type="password" id="account-change-pin" inputmode="numeric" pattern="[0-9]{6}" maxlength="6" autocomplete="new-password">
+          </div>
+          <button id="account-save-pin-btn" class="primary-btn">Update PIN</button>
+          <div class="account-error hidden" id="account-pin-error"></div>
+        </div>
+      </div>
+
+      <button id="account-page-signout-btn" class="secondary-btn account-signout-btn">Sign Out</button>
+    </div>
+  </section>
+
 </main>
 
 <div id="collect-toast" class="toast hidden"></div>
@@ -249,6 +298,27 @@
     <p id="resume-run-msg">Looks like the app closed mid-run. You can pick up right where you left off.</p>
     <button id="resume-run-confirm" class="primary-btn">Resume Run</button>
     <button id="resume-run-discard" class="secondary-btn">Discard</button>
+  </div>
+</div>
+
+<div id="mode-info-modal" class="modal hidden">
+  <div class="modal-box">
+    <h3>Game modes</h3>
+    <ul class="mode-info-list">
+      <li>
+        <h4>Free Explore</h4>
+        <p>No scoring, no clock. Wander to the points at your own pace, just for the fun of finding them.</p>
+      </li>
+      <li>
+        <h4>Time Trial</h4>
+        <p>Collect every point as fast as you can. Your total time is the score — end the run once you've got them all (or given up).</p>
+      </li>
+      <li>
+        <h4>Score Attack</h4>
+        <p>You get a fixed time budget. Farther points are worth more, but you're racing the clock — decide live what's actually reachable before time runs out.</p>
+      </li>
+    </ul>
+    <button id="mode-info-close" class="primary-btn">Got it</button>
   </div>
 </div>
 

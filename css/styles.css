@@ -153,6 +153,21 @@ body {
 .view.active { display: block; animation: cp-fade-in 0.22s ease; }
 @keyframes cp-fade-in { from { opacity: 0; } to { opacity: 1; } }
 
+.app-boot {
+  position: fixed;
+  inset: 0;
+  z-index: 5000;
+  background: var(--bg);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 18px;
+  transition: opacity 0.25s ease;
+}
+.app-boot.hidden { opacity: 0; pointer-events: none; }
+.app-boot-brand { font-family: var(--font-display); font-size: 15px; font-weight: 600; color: var(--text-dim); letter-spacing: 0.2px; }
+
 .loading-screen {
   height: 100%;
   display: flex;
@@ -194,12 +209,38 @@ body {
 .field-group { margin-bottom: 22px; }
 .field-group label {
   display: flex;
+  align-items: center;
   justify-content: space-between;
   font-size: 14px;
   font-weight: 600;
   color: var(--text-dim);
   margin-bottom: 8px;
 }
+
+.info-btn {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  border: 1px solid var(--border);
+  background: var(--bg-elev);
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: manipulation;
+}
+.info-btn:active { background: var(--bg-elev-2); }
+
+.mode-info-list { list-style: none; padding: 0; margin: 0 0 18px; }
+.mode-info-list li { margin-bottom: 14px; }
+.mode-info-list li:last-child { margin-bottom: 0; }
+.mode-info-list h4 { font-family: var(--font-display); font-size: 14px; font-weight: 600; margin: 0 0 3px; color: var(--text); }
+.mode-info-list p { font-size: 13px; color: var(--text-dim); margin: 0; line-height: 1.5; }
 .unit { color: var(--accent); font-weight: 700; font-variant-numeric: tabular-nums; }
 
 .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
@@ -266,6 +307,8 @@ input[type="range"]::-moz-range-thumb {
 }
 .seg.active { background: var(--accent); color: #06170f; }
 .seg:active { transform: scale(0.96); }
+.seg:disabled { color: var(--text-faint); opacity: 0.5; cursor: not-allowed; }
+.seg:disabled:active { transform: none; }
 
 .hint { font-size: 12.5px; color: var(--text-dim); margin: 6px 0 0; line-height: 1.45; }
 .hidden { display: none !important; }
@@ -302,7 +345,11 @@ input[type="range"]::-moz-range-thumb {
 }
 .secondary-btn:active { background: var(--bg-elev-2); transform: scale(0.98); }
 
-#view-run { position: relative; }
+/* The map fills the whole screen already — lock this view so a stray touch
+   can't rubber-band/scroll the page itself out from under it. (overflow:hidden
+   only — NOT touch-action:none, which would fight Leaflet's own pan/zoom
+   handling on the map underneath.) */
+#view-run { position: relative; overflow: hidden; }
 /* .map-viewport clips a #map that, in compass-rotate mode, is deliberately
    oversized (sized to the viewport's diagonal via JS) and rotated by heading —
    the oversizing means rotating it never reveals empty corners. Outside rotate
@@ -548,6 +595,37 @@ input[type="range"]::-moz-range-thumb {
   margin-bottom: 16px;
 }
 
+/* Foldable so a long point list doesn't push the share/export/new-run actions
+   several screens down after a big run. */
+.points-details {
+  background: var(--bg-elev);
+  border: 1px solid var(--border-soft);
+  border-radius: var(--radius-md);
+  margin-bottom: 20px;
+  overflow: hidden;
+}
+.points-details summary {
+  list-style: none;
+  cursor: pointer;
+  padding: 14px 16px;
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  touch-action: manipulation;
+}
+.points-details summary::-webkit-details-marker { display: none; }
+.points-details summary::after {
+  content: '▾';
+  color: var(--text-faint);
+  transition: transform 0.15s ease;
+  font-size: 12px;
+}
+.points-details[open] summary::after { transform: rotate(180deg); }
+.points-details .points-list { padding: 0 12px 6px; margin: 0; }
+
 .points-list { list-style: none; padding: 0; margin: 0 0 20px; }
 .points-list li {
   display: flex;
@@ -605,8 +683,8 @@ input[type="range"]::-moz-range-thumb {
   text-align: left;
 }
 .account-error { color: var(--danger); font-size: 12.5px; margin: 8px 0 0; line-height: 1.4; }
-.account-signedin { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
-.account-signedin .avatar {
+
+.avatar {
   width: 38px;
   height: 38px;
   border-radius: 50%;
@@ -620,9 +698,27 @@ input[type="range"]::-moz-range-thumb {
   font-size: 15px;
   flex: 0 0 auto;
 }
+.avatar-lg { width: 56px; height: 56px; font-size: 20px; }
+
+.account-signedin { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
 .account-signedin .who { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .account-signedin .email { font-size: 13px; color: var(--text-dim); word-break: break-all; }
 .account-signedin .secondary-btn { margin-top: 0; width: auto; padding: 8px 14px; font-size: 13px; flex: 0 0 auto; }
+
+.account-box-link { cursor: pointer; transition: background 0.15s ease, transform 0.1s ease; }
+.account-box-link:active { background: var(--bg-elev-2); transform: scale(0.99); }
+.account-chevron { font-size: 22px; color: var(--text-faint); flex: 0 0 auto; }
+
+.account-page-header {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin: 4px 0 28px;
+}
+.account-page-header h2 { font-family: var(--font-display); font-size: 19px; font-weight: 600; margin: 0 0 3px; }
+.account-page-header .hint { margin: 0; word-break: break-all; }
+.account-signout-btn { color: var(--danger); border-color: var(--danger-soft); }
+.account-signout-btn:active { background: var(--danger-soft); }
 
 /* ---------- History ---------- */
 .section-title { font-family: var(--font-display); margin: 0 0 16px; font-size: 20px; font-weight: 600; letter-spacing: -0.3px; }

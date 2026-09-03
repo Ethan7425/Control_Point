@@ -138,8 +138,8 @@ export async function generatePoints(center, settings) {
   let picked = selectSpaced(source, numPoints, minSpacing, maxSpacing);
 
   let loopGeometry = null;
-  if (layout === 'loop' && picked.length >= 3) {
-    const { order, geometry } = await orderAsLoop(picked);
+  if (layout === 'loop' && picked.length >= 1) {
+    const { order, geometry } = await orderAsLoop(picked, center);
     picked = order.map((i) => picked[i]);
     loopGeometry = geometry;
   }

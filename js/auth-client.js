@@ -1,8 +1,8 @@
 // Thin wrapper around Supabase Auth — email + 6-digit PIN (stored as Supabase's
 // "password"; 6 is the platform's hard floor, so that's what we use). Session
-// persistence, token refresh, etc. are all
-// handled by the supabase-js client itself; this module just gives app.js a
-// small, named surface instead of calling supabase.auth.* directly everywhere.
+// persistence, token refresh, etc. are all handled by the supabase-js client
+// itself; this module just gives app.js a small, named surface instead of
+// calling supabase.auth.* directly everywhere.
 
 import { supabase } from './supabase-client.js';
 
@@ -50,4 +50,9 @@ export async function sendPasswordReset(email) {
 export async function updatePin(newPin) {
   const { error } = await supabase.auth.updateUser({ password: newPin });
   return { error };
+}
+
+export async function updateDisplayName(name) {
+  const { data, error } = await supabase.auth.updateUser({ data: { display_name: name } });
+  return { user: data?.user ?? null, error };
 }

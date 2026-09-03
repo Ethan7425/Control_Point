@@ -8,6 +8,7 @@ import { downloadGPX } from './gpx.js';
 import { isOrientationSupported, requestOrientationPermission, watchHeading } from './heading.js';
 import {
   isAuthAvailable, getSession, onAuthStateChange, signUp, signIn, signOut, sendPasswordReset, updatePin,
+  updateDisplayName,
 } from './auth-client.js';
 import { pushRun, deleteRemoteRun, pullAndMergeRuns, pushAllLocalRuns } from './sync.js';
 
@@ -208,6 +209,10 @@ function onFieldChange(key) {
 }
 onFieldChange('layout');
 onFieldChange('mode');
+
+const modeInfoModal = document.getElementById('mode-info-modal');
+document.getElementById('mode-info-btn').addEventListener('click', () => modeInfoModal.classList.remove('hidden'));
+document.getElementById('mode-info-close').addEventListener('click', () => modeInfoModal.classList.add('hidden'));
 
 const sliderIds = ['radius', 'distance', 'numPoints', 'minSpacing', 'maxSpacing', 'timeBudget'];
 const sliderUnits = { radius: 'km', distance: 'km', numPoints: '', minSpacing: 'm', maxSpacing: 'm', timeBudget: 'min' };
@@ -499,16 +504,24 @@ document.getElementById('recenter-btn').addEventListener('click', () => {
   if (map && lastKnownLatLng) map.setView(lastKnownLatLng, Math.max(map.getZoom(), 16));
 });
 
-// ---------- compass rotation (heading-up map) ----------
+// ---------- map rotation (heading-lock compass mode + free manual rotate) ----------
 // Leaflet has no native rotation support, and naively CSS-rotating its own root
 // container would rotate the zoom/recenter controls with it and desync touch-drag
 // math (Leaflet computes pan deltas assuming an unrotated container). Instead: #map
 // is oversized (to the viewport's diagonal, so rotating it never reveals empty
 // corners) and rotated on its own, while the controls live outside it entirely as
-// plain siblings — and dragging is disabled while active, matching how every
-// navigation app handles a heading-locked "follow me" view.
+// plain siblings.
+//
+// Two independent ways to rotate, like a real map app:
+//  - compassMode: continuously follows device heading, dragging disabled (a
+//    "follow me" lock, same as before).
+//  - manualRotationDeg: a plain two-finger twist gesture, free to rotate however
+//    you like, dragging stays enabled. The compass button doubles as "reset to
+//    north" whenever you've manually rotated away from it.
 let compassMode = false;
 let stopHeadingWatch = null;
+let manualRotationDeg = 0;
+let rotateGesture = null; // { startAngle, startRotation } while a 2-finger twist is active
 
 function sizeMapForRotation(rotating) {
   const viewport = document.getElementById('map-viewport');
@@ -518,7 +531,6 @@ function sizeMapForRotation(rotating) {
     mapEl.style.height = '';
     mapEl.style.left = '';
     mapEl.style.top = '';
-    mapEl.style.transform = '';
   } else {
     const vw = viewport.clientWidth, vh = viewport.clientHeight;
     const diag = Math.ceil(Math.sqrt(vw * vw + vh * vh));
@@ -530,9 +542,49 @@ function sizeMapForRotation(rotating) {
   map?.invalidateSize();
 }
 
-function applyMapHeading(headingDeg) {
-  document.getElementById('map').style.transform = `rotate(${-headingDeg}deg)`;
+// Single setter for the actual rotation, used by both compass-follow and manual
+// twist — also spins the compass button's own icon to match, so it always shows
+// "this is where north actually is" at a glance, the way real map apps do.
+function setMapRotation(deg) {
+  const rounded = Math.round(deg * 10) / 10;
+  document.getElementById('map').style.transform = rounded ? `rotate(${rounded}deg)` : '';
+  document.getElementById('compass-toggle-btn').style.transform = rounded ? `rotate(${rounded}deg)` : '';
 }
+
+function applyMapHeading(headingDeg) {
+  setMapRotation(-headingDeg);
+}
+
+function resetMapRotation() {
+  manualRotationDeg = 0;
+  setMapRotation(0);
+  if (!compassMode) sizeMapForRotation(false);
+}
+
+function touchAngleDeg(touches) {
+  const dx = touches[1].clientX - touches[0].clientX;
+  const dy = touches[1].clientY - touches[0].clientY;
+  return (Math.atan2(dy, dx) * 180) / Math.PI;
+}
+
+const mapViewportEl = document.getElementById('map-viewport');
+// passive: true throughout — never call preventDefault, so Leaflet's own pinch-zoom
+// and single-finger pan keep working exactly as before; this just additionally
+// tracks the angle between the same two touches to rotate on top of that.
+mapViewportEl.addEventListener('touchstart', (e) => {
+  if (compassMode || e.touches.length !== 2) return;
+  rotateGesture = { startAngle: touchAngleDeg(e.touches), startRotation: manualRotationDeg };
+  sizeMapForRotation(true);
+}, { passive: true });
+mapViewportEl.addEventListener('touchmove', (e) => {
+  if (!rotateGesture || e.touches.length !== 2) return;
+  const delta = touchAngleDeg(e.touches) - rotateGesture.startAngle;
+  manualRotationDeg = rotateGesture.startRotation + delta;
+  setMapRotation(manualRotationDeg);
+}, { passive: true });
+mapViewportEl.addEventListener('touchend', (e) => {
+  if (e.touches.length < 2) rotateGesture = null;
+}, { passive: true });
 
 async function enableCompassMode() {
   if (!isOrientationSupported()) {
@@ -545,6 +597,7 @@ async function enableCompassMode() {
     return;
   }
   compassMode = true;
+  manualRotationDeg = 0;
   document.getElementById('compass-toggle-btn').classList.add('active');
   map.dragging.disable();
   map.doubleClickZoom.disable();
@@ -562,12 +615,13 @@ function disableCompassMode() {
     map.dragging.enable();
     map.doubleClickZoom.enable();
   }
-  sizeMapForRotation(false);
+  resetMapRotation();
 }
 
 document.getElementById('compass-toggle-btn').addEventListener('click', () => {
   if (!map) return;
   if (compassMode) disableCompassMode();
+  else if (Math.abs(manualRotationDeg) > 0.5) resetMapRotation();
   else enableCompassMode();
 });
 
@@ -602,6 +656,7 @@ function handleReroll(pointId) {
   pointCircles[idx] = L.circle([newPoint.lat, newPoint.lon], {
     radius: COLLECT_RADIUS_M, className: 'cp-radius-glow', ...circleStyle(false),
   }).addTo(map);
+  map.panTo([newPoint.lat, newPoint.lon], { animate: true }); // bring the new spot into view instead of leaving it off-screen
 
   showToast(`Point ${newPoint.index} re-rolled`);
   updateNextPointIndicator();
@@ -928,24 +983,89 @@ function applyAuthGate(gated) {
   }
 }
 
+function displayNameOf(user) {
+  return user?.user_metadata?.display_name?.trim() || '';
+}
+function avatarInitialOf(user) {
+  return escapeHtml((displayNameOf(user) || user?.email || '?').charAt(0).toUpperCase());
+}
+
+// Settings just shows a compact, tappable summary — full profile management
+// (display name, PIN change) lives on its own page, reached by tapping this.
 function renderSignedInBox(container) {
-  const initial = escapeHtml((currentUser.email || '?').charAt(0).toUpperCase());
+  const name = displayNameOf(currentUser);
   container.innerHTML = `
-    <div class="account-box">
+    <div class="account-box account-box-link" id="account-manage-link" role="button" tabindex="0">
       <div class="account-signedin">
         <div class="who">
-          <div class="avatar">${initial}</div>
+          <div class="avatar">${avatarInitialOf(currentUser)}</div>
           <div>
-            <h4>Synced</h4>
+            <h4>${name ? escapeHtml(name) : 'Synced'}</h4>
             <div class="email">${escapeHtml(currentUser.email)}</div>
           </div>
         </div>
-        <button id="account-signout-btn" class="secondary-btn">Sign Out</button>
+        <span class="account-chevron" aria-hidden="true">&rsaquo;</span>
       </div>
     </div>
   `;
-  document.getElementById('account-signout-btn').addEventListener('click', handleSignOut);
+  document.getElementById('account-manage-link').addEventListener('click', () => {
+    renderAccountPage();
+    showView('account');
+  });
 }
+
+function renderAccountPage() {
+  if (!currentUser) return;
+  const name = displayNameOf(currentUser);
+  document.getElementById('account-page-avatar').textContent = avatarInitialOf(currentUser);
+  document.getElementById('account-page-name').textContent = name || 'Your account';
+  document.getElementById('account-page-email').textContent = currentUser.email;
+  document.getElementById('account-display-name').value = name;
+  document.getElementById('account-change-pin').value = '';
+  document.getElementById('account-name-error').classList.add('hidden');
+  document.getElementById('account-pin-error').classList.add('hidden');
+}
+
+async function handleSaveDisplayName() {
+  const name = document.getElementById('account-display-name').value.trim();
+  const errEl = document.getElementById('account-name-error');
+  errEl.classList.add('hidden');
+  const { user, error } = await updateDisplayName(name);
+  if (error) {
+    errEl.textContent = error.message;
+    errEl.classList.remove('hidden');
+    return;
+  }
+  currentUser = user;
+  document.getElementById('account-page-name').textContent = name || 'Your account';
+  document.getElementById('account-page-avatar').textContent = avatarInitialOf(currentUser);
+  renderSignedInBox(document.getElementById('account-section'));
+  showToast('Display name saved');
+}
+
+async function handleChangePinFromAccount() {
+  const pin = document.getElementById('account-change-pin').value.trim();
+  const errEl = document.getElementById('account-pin-error');
+  errEl.classList.add('hidden');
+  if (!/^\d{6}$/.test(pin)) {
+    errEl.textContent = 'Enter a 6-digit PIN.';
+    errEl.classList.remove('hidden');
+    return;
+  }
+  const { error } = await updatePin(pin);
+  if (error) {
+    errEl.textContent = error.message;
+    errEl.classList.remove('hidden');
+    return;
+  }
+  document.getElementById('account-change-pin').value = '';
+  showToast('PIN updated');
+}
+
+document.getElementById('account-page-back').addEventListener('click', () => showView('settings'));
+document.getElementById('account-save-name-btn').addEventListener('click', handleSaveDisplayName);
+document.getElementById('account-save-pin-btn').addEventListener('click', handleChangePinFromAccount);
+document.getElementById('account-page-signout-btn').addEventListener('click', handleSignOut);
 
 function renderRecoveryForm(container) {
   container.innerHTML = `
@@ -1118,4 +1238,7 @@ async function initAuth() {
   }
   renderAccountSection();
 }
-initAuth().then(offerToResumeIfNeeded);
+initAuth().then(() => {
+  document.getElementById('app-boot')?.classList.add('hidden');
+  offerToResumeIfNeeded();
+});

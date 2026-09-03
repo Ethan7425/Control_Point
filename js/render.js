@@ -56,6 +56,8 @@ export function renderRunRecap(container, run, mapDivId) {
       ${typeof run.elevationGainM === 'number' ? `<div class="recap-card"><div class="v">↗ ${run.elevationGainM} m</div><div class="l">Elev gain</div></div>` : ''}
       ${typeof run.elevationLossM === 'number' ? `<div class="recap-card"><div class="v">↘ ${run.elevationLossM} m</div><div class="l">Elev loss</div></div>` : ''}
     </div>
+    <details class="points-details">
+      <summary>Points &middot; ${run.pointsCollected}/${run.pointsTotal} collected</summary>
     <ul class="points-list">
       ${run.points.map((p) => `
         <li>
@@ -64,6 +66,7 @@ export function renderRunRecap(container, run, mapDivId) {
         </li>
       `).join('')}
     </ul>
+    </details>
     <button id="share-run-btn" class="secondary-btn">Share Recap</button>
     <button id="export-gpx-btn" class="secondary-btn">Export GPX</button>
   `;
