@@ -4,26 +4,17 @@
 // signal somewhere along the way, instead of just going blank.
 
 import { destinationPoint } from './geo.js';
+import { buildTileUrl, getMapStyleKey } from './maptiles.js';
 
 // Must stay in sync with TILE_CACHE in service-worker.js — the SW reads from this
 // same Cache Storage entry, it just doesn't (and can't) import this module.
 const TILE_CACHE = 'control-point-tiles-v1';
 
-const SUBDOMAINS = ['a', 'b', 'c'];
 const ZOOM_LEVELS = [16, 17, 18]; // brackets the run map's default start zoom (17)
 const MAX_TILES = 450; // keeps a big radius/loop distance from downloading forever
 const BUFFER_M = 250; // covers incidental wandering off the exact search circle
 const CONCURRENCY = 6; // roughly matches a browser's per-host connection limit
 
-// Leaflet's default subdomain pick for a TileLayer using `{s}` with subdomains 'abc' —
-// this must match exactly, or a prefetched tile lands under a URL the live map never
-// actually requests, and the cache-first fetch handler in the service worker misses it.
-function subdomainFor(x, y) {
-  return SUBDOMAINS[Math.abs(x + y) % SUBDOMAINS.length];
-}
-function tileUrl(z, x, y) {
-  return `https://${subdomainFor(x, y)}.tile.openstreetmap.org/${z}/${x}/${y}.png`;
-}
 function lon2x(lon, z) {
   return Math.floor(((lon + 180) / 360) * 2 ** z);
 }
@@ -65,6 +56,7 @@ export function planTiles(center, radiusM) {
 export async function prefetchTiles(center, radiusM, { onProgress, signal } = {}) {
   if (!('caches' in window)) throw new Error('Offline caching isn’t supported on this device.');
 
+  const styleKey = getMapStyleKey();
   const tiles = planTiles(center, radiusM);
   const cache = await caches.open(TILE_CACHE);
   const total = tiles.length;
@@ -76,7 +68,7 @@ export async function prefetchTiles(center, radiusM, { onProgress, signal } = {}
     while (nextIndex < tiles.length) {
       if (signal?.aborted) return;
       const { z, x, y } = tiles[nextIndex++];
-      const url = tileUrl(z, x, y);
+      const url = buildTileUrl(styleKey, z, x, y);
       try {
         const already = await cache.match(url);
         if (!already) {

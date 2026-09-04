@@ -41,13 +41,40 @@ async function runQuery(ql) {
   throw lastError;
 }
 
+// Iteratively strips dead-end branches from a walkable-node graph — a spur,
+// driveway, or cul-de-sac, however long — down to the "core" network everyone
+// can actually loop through. Checking a node's own degree only ever catches the
+// very tip of a dead end; a point placed further up the *same* branch still
+// forces the identical out-and-back walk, so the whole branch has to go, not
+// just its endpoint. This is the standard leaf-peeling way to find a graph's
+// 2-core: repeatedly remove degree<=1 nodes and re-check their neighbors, same
+// as peeling an onion from the outside in.
+function findDeadEndNodes(neighborCount) {
+  const degree = new Map();
+  for (const [id, neighbors] of neighborCount) degree.set(id, neighbors.size);
+
+  const queue = [...degree].filter(([, d]) => d <= 1).map(([id]) => id);
+  const removed = new Set();
+  while (queue.length) {
+    const id = queue.pop();
+    if (removed.has(id)) continue;
+    removed.add(id);
+    for (const n of neighborCount.get(id) || []) {
+      if (removed.has(n)) continue;
+      const d = degree.get(n) - 1;
+      degree.set(n, d);
+      if (d <= 1) queue.push(n);
+    }
+  }
+  return removed;
+}
+
 // All walkable-way nodes within `radiusM` of center. One query covers the whole run
 // instead of one query per point, which is both faster and kinder to the public API.
 //
-// Dead-end tips (a node with only one neighbor in the fetched network — the end of
-// a spur, driveway, or cul-de-sac) are filtered out: reaching one of those forces
-// walking in and back out the same way, which is exactly the "20m out-and-back"
-// pattern we want the point picker to avoid. A through node always has 2+ neighbors.
+// Every node on a dead-end branch (not just its tip — see findDeadEndNodes) is
+// filtered out as a target: reaching one forces walking in and back out the same
+// way, exactly the "20m out-and-back" pattern the point picker should avoid.
 export async function fetchPathNodes(lat, lon, radiusM) {
   const ql = `
     [out:json][timeout:25];
@@ -79,10 +106,10 @@ export async function fetchPathNodes(lat, lon, radiusM) {
     for (let i = 0; i < nodes.length - 1; i++) addEdge(nodes[i], nodes[i + 1]);
   }
 
+  const deadEnds = findDeadEndNodes(neighborCount);
   const out = [];
   for (const [id, coords] of nodeById) {
-    const degree = neighborCount.get(id)?.size ?? 0;
-    if (degree <= 1) continue; // dead-end spur tip — skip as a target
+    if (deadEnds.has(id)) continue; // anywhere on a dead-end branch — skip as a target
     out.push(coords);
   }
   return out;

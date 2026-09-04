@@ -437,6 +437,7 @@ input[type="range"]::-moz-range-thumb {
   color: var(--accent);
   z-index: 500;
 }
+.area-map-btn-style.area-map-btn-style { top: 56px; font-size: 16px; }
 .area-center-pin {
   width: 16px;
   height: 16px;

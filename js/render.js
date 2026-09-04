@@ -1,7 +1,8 @@
 // Shared rendering for the end-of-run recap, reused by both the live recap
 // screen and the history detail view.
 
-import { COLLECT_RADIUS_M } from './run.js';
+import { COLLECT_RADIUS_M, splitRouteIntoSegments } from './run.js';
+import { getMapStyleKey, addTileLayer } from './maptiles.js';
 
 function fmtTime(ms) {
   const totalSec = Math.round(ms / 1000);
@@ -75,7 +76,7 @@ export function renderRunRecap(container, run, mapDivId) {
     const mapEl = document.getElementById(mapDivId);
     if (!mapEl || !run.route?.length) return;
     const map = L.map(mapDivId, { zoomControl: false, attributionControl: false, tap: true });
-    L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+    addTileLayer(map, getMapStyleKey());
 
     const bounds = L.latLngBounds([]);
 
@@ -88,9 +89,18 @@ export function renderRunRecap(container, run, mapDivId) {
       bounds.extend(suggested.getBounds());
     }
 
-    const latlngs = run.route.map((r) => [r.lat, r.lon]);
-    const routeLine = L.polyline(latlngs, { color: '#3b82f6', weight: 4, opacity: 0.85 }).addTo(map);
-    bounds.extend(routeLine.getBounds());
+    // GPS-gap stretches (screen locked / app backgrounded mid-run) are drawn as
+    // dashed gray connectors rather than folded into the solid trace — they're a
+    // straight-line guess bridging two real fixes, not an actual recorded path.
+    const { segments, gaps } = splitRouteIntoSegments(run.route);
+    gaps.forEach((g) => {
+      const gapLine = L.polyline(g, { color: '#94a3b8', weight: 3, opacity: 0.6, dashArray: '4,8', interactive: false }).addTo(map);
+      bounds.extend(gapLine.getBounds());
+    });
+    segments.forEach((seg) => {
+      const routeLine = L.polyline(seg, { color: '#3b82f6', weight: 4, opacity: 0.85 }).addTo(map);
+      bounds.extend(routeLine.getBounds());
+    });
 
     run.points.forEach((p) => {
       // Faint collection-radius ring so a near-miss is visible, not just a red dot.

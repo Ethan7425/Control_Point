@@ -6,6 +6,31 @@ import { haversine } from './geo.js';
 
 export const COLLECT_RADIUS_M = 20; // GPS in cities is often ±10m; 15-25m avoids false negatives
 const MIN_ELEV_DELTA_M = 3; // GPS altitude is noisy (often ±10-30m); ignore jitter below this
+// A gap this large between consecutive GPS fixes means the OS suspended us (screen
+// locked, app backgrounded) rather than normal watchPosition jitter, which is
+// typically a few seconds at most. The straight line connecting the two real fixes
+// on either side of a suspension isn't the path actually walked — see gapBefore below.
+const GPS_GAP_MS = 20000;
+
+// Splits a route into contiguous "we actually have fixes for this" segments plus
+// the straight-line connectors that bridge a suspension gap, so callers can render
+// the two differently instead of implying a real GPS trace across a gap.
+export function splitRouteIntoSegments(route) {
+  const segments = [];
+  const gaps = [];
+  let current = [];
+  route.forEach((pt, i) => {
+    if (i > 0 && pt.gapBefore) {
+      if (current.length) segments.push(current);
+      gaps.push([[route[i - 1].lat, route[i - 1].lon], [pt.lat, pt.lon]]);
+      current = [[pt.lat, pt.lon]];
+    } else {
+      current.push([pt.lat, pt.lon]);
+    }
+  });
+  if (current.length) segments.push(current);
+  return { segments, gaps };
+}
 
 export class RunController {
   constructor(settings, points, startPosition, loopGeometry = null) {
@@ -53,10 +78,13 @@ export class RunController {
 
   _pushRoutePoint(lat, lon, alt) {
     const prev = this.route[this.route.length - 1];
+    const t = Date.now();
+    const point = { lat, lon, t, alt: alt ?? null };
     if (prev) {
       this.distanceM += haversine(prev.lat, prev.lon, lat, lon);
+      if (t - prev.t > GPS_GAP_MS) point.gapBefore = true;
     }
-    this.route.push({ lat, lon, t: Date.now(), alt: alt ?? null });
+    this.route.push(point);
 
     // A simple noise gate: only bank a gain/loss once altitude has actually moved
     // past the jitter floor, so GPS wobble doesn't inflate elevation gain to

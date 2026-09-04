@@ -1,7 +1,7 @@
 // App-shell cache so the PWA installs and opens offline. Live data (Overpass,
 // OSRM, GPS) is always network-only — only the shell and map tiles are cached.
 
-const SHELL_CACHE = 'control-point-shell-v29';
+const SHELL_CACHE = 'control-point-shell-v31';
 const TILE_CACHE = 'control-point-tiles-v1';
 
 const SHELL_ASSETS = [
@@ -15,6 +15,7 @@ const SHELL_ASSETS = [
   './js/geo.js',
   './js/gpx.js',
   './js/heading.js',
+  './js/maptiles.js',
   './js/overpass.js',
   './js/points.js',
   './js/tilecache.js',
@@ -52,7 +53,7 @@ self.addEventListener('activate', (event) => {
 });
 
 function isTileRequest(url) {
-  return /tile\.openstreetmap\.org/.test(url);
+  return /tile\.openstreetmap\.org|basemaps\.cartocdn\.com|tile\.opentopomap\.org/.test(url);
 }
 
 function isLiveDataRequest(url) {

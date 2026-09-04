@@ -1,7 +1,8 @@
 import { getCurrentPosition, GeoWatcher, bearing, compassDirection, haversine, destinationPoint } from './geo.js';
 import { generatePoints, rerollPoint } from './points.js';
 import { prefetchTiles } from './tilecache.js';
-import { RunController, COLLECT_RADIUS_M } from './run.js';
+import { MAP_STYLES, getMapStyleKey, setMapStyleKey, cycleMapStyleKey, addTileLayer } from './maptiles.js';
+import { RunController, COLLECT_RADIUS_M, splitRouteIntoSegments } from './run.js';
 import { saveRun, getAllRuns, getRun, deleteRun } from './db.js';
 import { renderRunRecap, renderHistoryList, renderHistorySummary, fmtTime } from './render.js';
 import { unlockAudio, feedbackCollect, feedbackTimeUp } from './feedback.js';
@@ -16,7 +17,7 @@ import { pushRun, deleteRemoteRun, pullAndMergeRuns, pushAllLocalRuns } from './
 // ---------- version ----------
 // Bump this on every push — it's the quickest way to confirm a device is actually
 // running the latest deploy (shown small next to the app name in the header).
-const APP_VERSION = '1.3.0';
+const APP_VERSION = '1.4.0';
 document.getElementById('app-version').textContent = `v${APP_VERSION}`;
 console.log(`Control Point v${APP_VERSION}`);
 
@@ -183,7 +184,7 @@ const fields = { mode: 'explore', layout: 'scatter', style: 'path' };
 
 // Search-area map state, declared early since onFieldChange('layout') below (called
 // at setup time, before the map itself is ever built) touches it via updateAreaMapRadius().
-let areaMap = null, areaMapInited = false;
+let areaMap = null, areaMapInited = false, areaTileLayer = null;
 let areaCircle = null, areaCenterMarker = null, areaEdgeMarker = null, areaMeMarker = null;
 let areaTrueLoc = null; // last known real GPS fix, for the "me" reference dot
 let areaOverrideCenter = null; // {lat, lon} once the user drags the pin away from "me"; null = follow me
@@ -317,7 +318,7 @@ async function initAreaMap() {
 
   areaMap = L.map('area-map', { zoomControl: false, attributionControl: false })
     .setView([areaTrueLoc.lat, areaTrueLoc.lon], 15); // fitAreaMapToCircle() below replaces this once the circle exists
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(areaMap);
+  areaTileLayer = addTileLayer(areaMap, getMapStyleKey());
 
   areaMeMarker = L.marker([areaTrueLoc.lat, areaTrueLoc.lon], {
     icon: L.divIcon({ className: '', html: '<div class="area-me-dot"></div>', iconSize: [12, 12] }),
@@ -383,6 +384,23 @@ document.getElementById('area-recenter-btn').addEventListener('click', async () 
   areaCircle.setLatLng([areaTrueLoc.lat, areaTrueLoc.lon]);
   updateAreaMapRadius(); // also re-fits the view to the circle
 });
+
+// ---------- map style (standard / dark / outdoor) ----------
+// One shared preference across both the search-area map and the live run map — a
+// style you picked to plan the run should be the one you're actually running with.
+function updateMapAttribution() {
+  const attrEl = document.querySelector('.map-attribution');
+  if (attrEl) attrEl.innerHTML = MAP_STYLES[getMapStyleKey()].attribution;
+}
+function cycleMapStyle() {
+  const next = cycleMapStyleKey(getMapStyleKey());
+  setMapStyleKey(next);
+  if (areaMap) { areaTileLayer?.remove(); areaTileLayer = addTileLayer(areaMap, next); }
+  if (map) { runTileLayer?.remove(); runTileLayer = addTileLayer(map, next); }
+  updateMapAttribution();
+}
+document.getElementById('area-map-style-btn')?.addEventListener('click', cycleMapStyle);
+document.getElementById('map-style-btn')?.addEventListener('click', cycleMapStyle);
 
 // ---------- offline tile pre-caching ----------
 // Downloads the map tiles for the current search area into Cache Storage right now,
@@ -661,7 +679,7 @@ document.getElementById('resume-run-confirm').addEventListener('click', () => {
 // run, before the login screen has had a chance to take over.
 
 // ---------- run session ----------
-let map, userMarker, userRadar, userAccuracyCircle, routeLine, loopRouteLine, pointMarkers = [], pointCircles = [];
+let map, runTileLayer, userMarker, userRadar, userAccuracyCircle, routeLine, loopRouteLine, pointMarkers = [], pointCircles = [];
 let runController, geoWatcher, statsTimer, lastKnownLatLng = null, timeUpAnnounced = false;
 let currentCenter = null, currentRerollContext = null;
 
@@ -932,7 +950,8 @@ function startRunSession(center, settings, points, usedFallback, loopGeometry, r
     touchZoom: 'center',
   }).setView([center.lat, center.lon], 17);
 
-  L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 }).addTo(map);
+  runTileLayer = addTileLayer(map, getMapStyleKey());
+  updateMapAttribution();
 
   loopRouteLine = null;
   if (loopGeometry?.length) {
@@ -955,8 +974,8 @@ function startRunSession(center, settings, points, usedFallback, loopGeometry, r
       ...circleStyle(state),
     }).addTo(map);
   });
-  const initialRoute = resumeState ? runController.route.map((r) => [r.lat, r.lon]) : [[center.lat, center.lon]];
-  routeLine = L.polyline(initialRoute, { color: '#3b82f6', weight: 4, opacity: 0.85 }).addTo(map);
+  const initialRoute = resumeState ? runController.route : [{ lat: center.lat, lon: center.lon }];
+  routeLine = drawRouteSegments(map, initialRoute);
   userRadar = L.marker([center.lat, center.lon], { icon: radarIcon(), interactive: false, zIndexOffset: 900 }).addTo(map);
   userMarker = L.marker([center.lat, center.lon], { icon: userIcon(), zIndexOffset: 1000 }).addTo(map);
 
@@ -966,6 +985,21 @@ function startRunSession(center, settings, points, usedFallback, loopGeometry, r
   statsTimer = setInterval(updateStatBar, 1000);
   updateStatBar();
   saveActiveRun();
+}
+
+const ROUTE_STYLE = { color: '#3b82f6', weight: 4, opacity: 0.85 };
+// A GPS-gap connector: styled like the loop's "suggested path" dashed line so it
+// reads the same way — a guess bridging two real fixes, not an actual GPS trace.
+const ROUTE_GAP_STYLE = { color: '#94a3b8', weight: 3, opacity: 0.6, dashArray: '4,8', interactive: false };
+
+// Draws a route as one or more solid polylines, with dashed gray connectors across
+// any GPS suspension gap (see splitRouteIntoSegments), and returns the last/still-
+// growing solid segment so the caller can keep extending it with addLatLng.
+function drawRouteSegments(map, route) {
+  const { segments, gaps } = splitRouteIntoSegments(route);
+  gaps.forEach((g) => L.polyline(g, ROUTE_GAP_STYLE).addTo(map));
+  const lines = segments.map((seg) => L.polyline(seg, ROUTE_STYLE).addTo(map));
+  return lines[lines.length - 1] || L.polyline([], ROUTE_STYLE).addTo(map);
 }
 
 function showToast(text) {
@@ -983,7 +1017,19 @@ function onPositionUpdate(pos) {
   lastKnownLatLng = [lat, lon];
   userMarker.setLatLng([lat, lon]);
   userRadar.setLatLng([lat, lon]);
-  routeLine.addLatLng([lat, lon]);
+
+  const lastRoutePoint = runController.route[runController.route.length - 1];
+  if (lastRoutePoint.gapBefore) {
+    // Screen was locked or the app was backgrounded long enough that GPS updates
+    // stopped — bridge the gap with a dashed connector instead of quietly folding
+    // it into the solid route, which would misrepresent it as an actual GPS trace.
+    const prevRoutePoint = runController.route[runController.route.length - 2];
+    L.polyline([[prevRoutePoint.lat, prevRoutePoint.lon], [lat, lon]], ROUTE_GAP_STYLE).addTo(map);
+    routeLine = L.polyline([[lat, lon]], ROUTE_STYLE).addTo(map);
+    showToast('GPS was paused — route continues from here');
+  } else {
+    routeLine.addLatLng([lat, lon]);
+  }
   if (compassMode) map.setView([lat, lon], map.getZoom(), { animate: false });
 
   if (userAccuracyCircle) {
