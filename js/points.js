@@ -3,7 +3,7 @@
 // perfectly efficient layout — some randomness/dead-ends are intentional.
 
 import { haversine, destinationPoint } from './geo.js';
-import { fetchPathNodes, fetchPOINodes, planSequentialLoop } from './overpass.js';
+import { fetchPathNodes, fetchPOINodes, planFixedOrderRoute } from './overpass.js';
 
 const MIN_DIST_FROM_START = 25; // don't drop a point right on top of the user
 const FINISH_MIN_DIST = 40; // the loop's last point sits this far from start...
@@ -112,6 +112,57 @@ async function buildSource(center, effectiveRadiusM, style) {
   return { source, pool: fetchedPool, usedFallback };
 }
 
+// Arranges `count` points in an actual geometric ring around `center` — evenly
+// spaced by angle, walked in one consistent rotational direction, with some
+// per-slot angle/radius jitter so it isn't a perfectly robotic circle — then
+// snaps each ring slot to the nearest real candidate from `pool` (or just uses
+// the ideal ring position when there's no real data, e.g. 'random' style).
+//
+// Points come back already in loop order, angularly adjacent by construction.
+// That's the actual fix for backtracking: previously, points were picked from
+// the pool with no regard for their spatial arrangement, then handed to a
+// shortest-path solver to find a visiting order — which can legitimately need
+// to double back if the points themselves aren't laid out in a loop shape to
+// begin with. Deciding the loop's shape first and only asking a router for the
+// walking geometry between already-ordered points (see planFixedOrderRoute)
+// means the route can't crisscross the middle of the loop chasing a shortcut.
+function buildRingPoints(center, radiusM, count, pool, minSpacing) {
+  const points = [];
+  const idealSlots = [];
+  if (count <= 0) return { points, idealSlots };
+
+  const startAngle = Math.random() * 360;
+  const direction = Math.random() < 0.5 ? 1 : -1; // clockwise or counter-clockwise, picked once for the whole loop
+  const angleStep = 360 / count;
+  const usedKeys = new Set();
+
+  for (let i = 0; i < count; i++) {
+    const jitter = (Math.random() - 0.5) * angleStep * 0.6;
+    const angle = (startAngle + direction * i * angleStep + jitter + 360) % 360;
+    const radiusForSlot = radiusM * (0.7 + Math.random() * 0.35); // organic, not a perfect circle
+    const ideal = destinationPoint(center.lat, center.lon, angle, radiusForSlot);
+    idealSlots.push(ideal);
+
+    let cand = null;
+    if (pool?.length) {
+      let best = null, bestDist = Infinity;
+      for (const p of pool) {
+        const key = `${p.lat.toFixed(6)},${p.lon.toFixed(6)}`;
+        if (usedKeys.has(key)) continue;
+        if (points.some((c) => haversine(c.lat, c.lon, p.lat, p.lon) < minSpacing)) continue;
+        const d = haversine(ideal.lat, ideal.lon, p.lat, p.lon);
+        if (d < bestDist) { bestDist = d; best = p; }
+      }
+      cand = best;
+    }
+    if (!cand) cand = ideal;
+
+    usedKeys.add(`${cand.lat.toFixed(6)},${cand.lon.toFixed(6)}`);
+    points.push(cand);
+  }
+  return { points, idealSlots };
+}
+
 function toPoint(candidate, index, center) {
   const distFromStart = haversine(center.lat, center.lon, candidate.lat, candidate.lon);
   return {
@@ -145,29 +196,36 @@ export async function generatePoints(center, settings, areaCenter = center) {
   return { points, usedFallback, loopGeometry: null, rerollContext: { pool, effectiveRadiusM, areaCenter } };
 }
 
+// The radius a loop of `distanceKm` would naturally trace if it were a plain
+// circle (circumference = 2*pi*r) — exported so the settings-screen preview map
+// can show the same number the generator will actually aim for.
+export function distanceDerivedRadiusM(distanceKm) {
+  return (distanceKm * 1000) / (2 * Math.PI);
+}
+
 // A structured course, not a free scatter: point 1 is where you start (collected
 // automatically — you're already there), the last point sits a short, deliberate
 // distance from start (so it isn't trivially the same spot as point 1), and the
 // points in between are visited strictly in order. Collection order is enforced
 // by RunController, not here — this just decides *what* that order is.
+//
+// Radius and distance are two distinct dials, not one derived from the other:
+// `radiusKm` is a hard boundary on how far the loop is allowed to reach (the same
+// "search area" control Scatter uses, and the same circle you drag on the settings
+// map), while `distanceKm` is the length you're aiming for. The ring's actual
+// radius is whichever is smaller — so widening the search area lets a longer loop
+// happen, but never forces one past a boundary you set on purpose.
 async function generateSequentialLoop(center, settings, areaCenter = center) {
-  const { distanceKm, numPoints, minSpacing, maxSpacing, style } = settings;
-  const effectiveRadiusM = (distanceKm * 1000) / (2 * Math.PI) * (0.85 + Math.random() * 0.3); // organic, not a perfect circle
+  const { distanceKm, radiusKm, numPoints, minSpacing, style } = settings;
+  const organicDistanceRadiusM = distanceDerivedRadiusM(distanceKm) * (0.85 + Math.random() * 0.3); // organic, not a perfect circle
+  const effectiveRadiusM = Math.min(organicDistanceRadiusM, radiusKm * 1000);
   const middleCount = Math.max(0, numPoints - 2);
 
-  const { source, pool, usedFallback } = await buildSource(areaCenter, effectiveRadiusM, style);
-  const middleCandidates = selectSpaced(source, middleCount, minSpacing, maxSpacing);
+  const { pool, usedFallback } = await buildSource(areaCenter, effectiveRadiusM, style);
+  const { points: orderedMiddle, idealSlots } = buildRingPoints(areaCenter, effectiveRadiusM, middleCount, pool, minSpacing);
   const finishCandidate = randomInDisk(center, FINISH_MAX_DIST, FINISH_MIN_DIST);
 
-  let orderedMiddle = middleCandidates;
-  let loopGeometry = null;
-  try {
-    const { order, geometry } = await planSequentialLoop(middleCandidates, center, finishCandidate);
-    orderedMiddle = order.map((i) => middleCandidates[i]);
-    loopGeometry = geometry;
-  } catch (e) {
-    console.warn('Sequential loop planning failed, using unordered middle points:', e.message);
-  }
+  const loopGeometry = await planFixedOrderRoute([center, ...orderedMiddle, finishCandidate]).catch(() => null);
 
   const allCandidates = [{ ...center, name: 'Start' }, ...orderedMiddle, { ...finishCandidate, name: 'Finish' }];
   const points = allCandidates.map((p, i) => toPoint(p, i + 1, center));
@@ -181,6 +239,7 @@ async function generateSequentialLoop(center, settings, areaCenter = center) {
     rerollContext: {
       pool, effectiveRadiusM, areaCenter,
       sequential: true,
+      idealSlots, // this middle point's spot in the ring, by index — see rerollPoint
       finishAnchor: center,
       finishMinDist: FINISH_MIN_DIST,
       finishMaxDist: FINISH_MAX_DIST,
@@ -193,7 +252,7 @@ async function generateSequentialLoop(center, settings, areaCenter = center) {
 // generation pass when available (no extra network round-trip); falls back to a
 // synthetic random point otherwise — always succeeds, never blocks on a network call.
 export function rerollPoint(target, allPoints, center, settings, rerollContext) {
-  const { pool, effectiveRadiusM, sequential, finishAnchor, finishMinDist, finishMaxDist, areaCenter } = rerollContext;
+  const { pool, effectiveRadiusM, sequential, idealSlots, finishAnchor, finishMinDist, finishMaxDist, areaCenter } = rerollContext;
   const others = allPoints.filter((p) => p.id !== target.id);
   const usedKeys = new Set(others.map((p) => `${p.lat.toFixed(6)},${p.lon.toFixed(6)}`));
   const respectsSpacing = (cand) => others.every((p) => haversine(p.lat, p.lon, cand.lat, cand.lon) >= settings.minSpacing);
@@ -201,15 +260,28 @@ export function rerollPoint(target, allPoints, center, settings, rerollContext) 
   // The loop's finish point has its own tight "near start" placement rule — reroll
   // must respect that too, or it could end up anywhere in the full loop radius.
   const isFinishPoint = sequential && target.index === allPoints.length;
+  // A middle point's spot in the ring (see buildRingPoints) — reroll biases back
+  // toward it instead of anywhere in the whole search area, or it could land
+  // clear across the loop and force the same crisscrossing this was built to avoid.
+  const ringSlot = sequential && !isFinishPoint ? idealSlots?.[target.index - 1] : null;
 
   let chosen = null;
   if (!isFinishPoint && settings.style !== 'random' && pool?.length) {
-    const available = shuffle(pool.filter((c) => !usedKeys.has(`${c.lat.toFixed(6)},${c.lon.toFixed(6)}`)));
-    chosen = available.find(respectsSpacing) || available[0] || null;
+    const available = pool.filter((c) => !usedKeys.has(`${c.lat.toFixed(6)},${c.lon.toFixed(6)}`));
+    const spaced = available.filter(respectsSpacing);
+    const candidates = spaced.length ? spaced : available;
+    if (ringSlot && candidates.length) {
+      chosen = candidates.reduce((best, c) => (
+        !best || haversine(ringSlot.lat, ringSlot.lon, c.lat, c.lon) < haversine(ringSlot.lat, ringSlot.lon, best.lat, best.lon)
+          ? c : best
+      ), null);
+    } else {
+      chosen = shuffle(candidates)[0] || null;
+    }
   }
   if (!chosen) {
-    const anchor = isFinishPoint ? finishAnchor : (areaCenter || center);
-    const maxDist = isFinishPoint ? finishMaxDist : effectiveRadiusM;
+    const anchor = isFinishPoint ? finishAnchor : (ringSlot || areaCenter || center);
+    const maxDist = isFinishPoint ? finishMaxDist : (ringSlot ? Math.min(settings.maxSpacing, effectiveRadiusM * 0.4) : effectiveRadiusM);
     const minDist = isFinishPoint ? finishMinDist : undefined;
     for (let i = 0; i < 40; i++) {
       const cand = randomInDisk(anchor, maxDist, minDist);

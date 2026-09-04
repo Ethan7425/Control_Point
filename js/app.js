@@ -1,5 +1,6 @@
 import { getCurrentPosition, GeoWatcher, bearing, compassDirection, haversine, destinationPoint } from './geo.js';
-import { generatePoints, rerollPoint } from './points.js';
+import { generatePoints, rerollPoint, distanceDerivedRadiusM } from './points.js';
+import { planFixedOrderRoute } from './overpass.js';
 import { prefetchTiles } from './tilecache.js';
 import { MAP_STYLES, getMapStyleKey, setMapStyleKey, cycleMapStyleKey, addTileLayer } from './maptiles.js';
 import { RunController, COLLECT_RADIUS_M, splitRouteIntoSegments } from './run.js';
@@ -17,7 +18,7 @@ import { pushRun, deleteRemoteRun, pullAndMergeRuns, pushAllLocalRuns } from './
 // ---------- version ----------
 // Bump this on every push — it's the quickest way to confirm a device is actually
 // running the latest deploy (shown small next to the app name in the header).
-const APP_VERSION = '1.4.0';
+const APP_VERSION = '1.6.0';
 document.getElementById('app-version').textContent = `v${APP_VERSION}`;
 console.log(`Control Point v${APP_VERSION}`);
 
@@ -201,7 +202,6 @@ document.querySelectorAll('.segmented').forEach((group) => {
   });
 });
 
-const rowRadius = document.getElementById('row-radius');
 const rowDistance = document.getElementById('row-distance');
 const rowTimeBudget = document.getElementById('row-timeBudget');
 const modeHint = document.getElementById('mode-hint');
@@ -212,11 +212,16 @@ const MODE_HINTS = {
   scoreAttack: 'Fixed time budget. Farther points are worth more — decide live what’s reachable before time runs out.',
 };
 
+const areaHint = document.getElementById('area-hint');
+const AREA_HINT_SCATTER = 'Drag the center pin to move the search area away from you, drag the ring handle to resize it. Leave it alone to search around your actual location.';
+const AREA_HINT_LOOP = 'Drag the center pin to move the loop away from you, drag the ring handle to set how far it’s allowed to reach. This is a hard boundary — the loop length below is a separate target, capped to whatever fits inside this radius.';
+
 function onFieldChange(key) {
   if (key === 'layout') {
-    rowRadius.classList.toggle('hidden', fields.layout !== 'scatter');
     rowDistance.classList.toggle('hidden', fields.layout !== 'loop');
+    areaHint.textContent = fields.layout === 'loop' ? AREA_HINT_LOOP : AREA_HINT_SCATTER;
     updateAreaMapRadius();
+    updateDistanceRadiusHint();
   }
   if (key === 'mode') {
     rowTimeBudget.classList.toggle('hidden', fields.mode !== 'scoreAttack');
@@ -251,11 +256,10 @@ sliderIds.forEach((id) => {
 // previous behavior: search area centered on wherever you happen to be when you start.
 function clamp(v, lo, hi) { return Math.min(hi, Math.max(lo, v)); }
 
+// The search-area circle always means the same thing regardless of layout: how far
+// the point generator is allowed to reach. In Loop mode that's a boundary the target
+// distance below gets capped to, not something distance silently redefines anymore.
 function currentPreviewRadiusM() {
-  if (fields.layout === 'loop') {
-    const distanceKm = parseFloat(document.getElementById('distance').value);
-    return (distanceKm * 1000) / (2 * Math.PI);
-  }
   return parseFloat(document.getElementById('radius').value) * 1000;
 }
 
@@ -263,19 +267,27 @@ function edgePosFor(center, radiusM) {
   return destinationPoint(center.lat, center.lon, 90, radiusM);
 }
 
-// Writes a dragged ring-handle radius back into the relevant slider (so the numeric
-// value and label stay truthful), rounded to that slider's own step.
+// Writes a dragged ring-handle radius back into the radius slider (so the numeric
+// value and label stay truthful), rounded to the slider's own step.
 function applyPreviewRadiusToSlider(radiusM) {
-  if (fields.layout === 'loop') {
-    const el = document.getElementById('distance');
-    const km = clamp((radiusM * 2 * Math.PI) / 1000, parseFloat(el.min), parseFloat(el.max));
-    el.value = (Math.round(km / 0.5) * 0.5).toFixed(1);
-  } else {
-    const el = document.getElementById('radius');
-    const km = clamp(radiusM / 1000, parseFloat(el.min), parseFloat(el.max));
-    el.value = (Math.round(km / 0.1) * 0.1).toFixed(1);
-  }
-  document.getElementById(fields.layout === 'loop' ? 'distance' : 'radius').dispatchEvent(new Event('input'));
+  const el = document.getElementById('radius');
+  const km = clamp(radiusM / 1000, parseFloat(el.min), parseFloat(el.max));
+  el.value = (Math.round(km / 0.1) * 0.1).toFixed(1);
+  el.dispatchEvent(new Event('input'));
+}
+
+// Tells you up front whether your target loop distance actually fits inside the
+// search radius you've set, instead of silently capping it and leaving you to
+// wonder later why the run came up short.
+function updateDistanceRadiusHint() {
+  if (fields.layout !== 'loop') return;
+  const distanceKm = parseFloat(document.getElementById('distance').value);
+  const radiusKm = parseFloat(document.getElementById('radius').value);
+  const neededKm = distanceDerivedRadiusM(distanceKm) / 1000;
+  const hintEl = document.getElementById('distance-radius-hint');
+  hintEl.textContent = neededKm <= radiusKm
+    ? `Fits comfortably inside your ${radiusKm.toFixed(1)} km search radius.`
+    : `Needs about ${neededKm.toFixed(1)} km of radius for the full length — widen the search radius above, or the loop will come up short.`;
 }
 
 // Keeps the whole circle (plus its edge handle) AND your real position in view —
@@ -301,7 +313,10 @@ function updateAreaMapRadius() {
   fitAreaMapToCircle();
   resetTileDownloadStatus(); // area changed — a stale "ready for offline use" would be misleading
 }
-['radius', 'distance'].forEach((id) => document.getElementById(id).addEventListener('input', updateAreaMapRadius));
+document.getElementById('radius').addEventListener('input', updateAreaMapRadius);
+document.getElementById('radius').addEventListener('input', updateDistanceRadiusHint);
+document.getElementById('distance').addEventListener('input', updateDistanceRadiusHint);
+updateDistanceRadiusHint();
 
 async function initAreaMap() {
   if (areaMapInited) return;
@@ -912,6 +927,22 @@ function handleReroll(pointId) {
 
   showToast(`Point ${newPoint.index} re-rolled`);
   updateNextPointIndicator();
+  saveActiveRun();
+
+  // Loop mode's suggested dashed path was drawn for the old point set — refresh it
+  // so it doesn't keep showing a route through a spot you just moved away from.
+  if (runController.sequential) refreshLoopGeometry();
+}
+
+async function refreshLoopGeometry() {
+  const orderedCoords = runController.points.map((p) => ({ lat: p.lat, lon: p.lon }));
+  const geometry = await planFixedOrderRoute(orderedCoords).catch(() => null);
+  if (!geometry || !map) return;
+  runController.loopGeometry = geometry;
+  loopRouteLine?.remove();
+  loopRouteLine = L.polyline(geometry, {
+    color: '#f59e0b', weight: 3, opacity: 0.5, dashArray: '6,10', interactive: false,
+  }).addTo(map);
   saveActiveRun();
 }
 

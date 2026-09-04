@@ -137,32 +137,26 @@ export async function fetchPOINodes(lat, lon, radiusM) {
     }));
 }
 
-// Best-effort ordering + route geometry for a sequential loop course, via the
-// public OSRM trip service (foot profile). `start` and `finish` are pinned as
-// the fixed first/last waypoints (an *open* trip, not roundtrip — finish is a
-// separate point near start, not literally the same coordinate), and OSRM
-// optimizes the walking order of everything in between. Falls back silently to
-// the caller's own ordering with no geometry if the request fails — the
-// suggested path is a nice-to-have, never a requirement to start a run.
-export async function planSequentialLoop(middlePoints, start, finish) {
-  const allCoords = [start, ...middlePoints, finish];
-  const coordsStr = allCoords.map((p) => `${p.lon},${p.lat}`).join(';');
-  const url = `https://router.project-osrm.org/trip/v1/foot/${coordsStr}?roundtrip=false&source=first&destination=last&geometries=geojson&overview=full`;
+// Walking-route geometry for a sequential loop course, via the public OSRM route
+// service (foot profile), visiting `orderedCoords` in EXACTLY the order given —
+// unlike the `trip` service, `route` never reorders waypoints looking for a
+// shorter tour. The order is decided beforehand by points.js's ring construction
+// (points are placed angularly around the loop, so they're already visit-order),
+// which is what keeps this from ever routing a "shortest path" that crosses back
+// through the middle of the loop to save a few meters. Falls back to no geometry
+// (a straight-line loop is still runnable, just without the dashed suggested
+// path) if the request fails — this is a nice-to-have, never a requirement.
+export async function planFixedOrderRoute(orderedCoords) {
+  const coordsStr = orderedCoords.map((p) => `${p.lon},${p.lat}`).join(';');
+  const url = `https://router.project-osrm.org/route/v1/foot/${coordsStr}?geometries=geojson&overview=full`;
   try {
     const res = await fetch(url);
-    if (!res.ok) throw new Error('OSRM trip failed');
+    if (!res.ok) throw new Error('OSRM route failed');
     const data = await res.json();
-    if (data.code !== 'Ok') throw new Error('OSRM trip returned error');
-    // waypoints[0] is `start`, waypoints[last] is `finish` — drop both, order the rest.
-    const order = data.waypoints
-      .slice(1, -1)
-      .map((w, originalIndex) => ({ originalIndex, tripIndex: w.waypoint_index }))
-      .sort((a, b) => a.tripIndex - b.tripIndex)
-      .map((w) => w.originalIndex);
-    const geometry = data.trips?.[0]?.geometry?.coordinates?.map(([lon, lat]) => [lat, lon]) || null;
-    return { order, geometry };
+    if (data.code !== 'Ok') throw new Error('OSRM route returned error');
+    return data.routes?.[0]?.geometry?.coordinates?.map(([lon, lat]) => [lat, lon]) || null;
   } catch (e) {
-    console.warn('OSRM sequential loop ordering unavailable, using original order:', e.message);
-    return { order: middlePoints.map((_, i) => i), geometry: null };
+    console.warn('OSRM fixed-order route unavailable:', e.message);
+    return null;
   }
 }
